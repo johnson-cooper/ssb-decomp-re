@@ -166,7 +166,7 @@ extern MObjSub *dPikachuModel_gap_0x2B78_sub_0x1400[];
 extern MObjSub *dPikachuModel_gap_0x2B78_sub_0x13E0[];
 extern MObjSub *dPikachuModel_gap_0x2B78_sub_0x13B0[];
 extern MObjSub *dPikachuModel_gap_0x2B78_sub_0x13C8[];
-extern u16 *dPikachuModel_gap_0x59B8_sub_0xB94[];
+extern AObjEvent32 *dPikachuModel_gap_0x59B8_sub_0xB94[];
 /* MObjSub-dispatch table at file 0x0000 (64 bytes, 16 u32 slots).
  * Sparse pointer array — chain-encoded `MObjSub **` pointers to the
  * trailing-index cells inside dPikachuModel_Joint_0x0040_post. The original splitter
@@ -3875,10 +3875,24 @@ u16 dPikachuModel_gap_0x59B8_sub_0xB74[16] = {
 	#include <PikachuModel/gap_0x59B8_sub_0xB74.palette.inc.c>
 };
 
-/* Palette pointer array @ 0x654C (5 entries, last 3 NULL) */
-u16 *dPikachuModel_gap_0x59B8_sub_0xB94[5] = {
-	dPikachuModel_gap_0x59B8_sub_0xB4C,
-	dPikachuModel_gap_0x59B8_sub_0xB74,
+/* Pikachu accessory costume material-animation scripts @ 0x654C.
+ *
+ * FTAccessPart.costume_matanim_joints points here (PikachuMain +0x130), and
+ * lbCommonAddMObjForFighterPartsDObj consumes one AObjEvent32 script for each
+ * of the two accessory MObjSub entries at 0x6350.  These two script bodies
+ * were historically extracted as u16 ".palette" blocks because their raw
+ * bytes resemble TLUT data.  Keep the bodies u16 so the file layout remains
+ * exact, but type the dispatch table correctly and cast the targets.  The
+ * PS2 DAT builder's mistyped-script pass then restores each 32-bit event's
+ * halfword order after little-endian compilation.
+ *
+ * Without that correction gcParseMObjMatAnimJoint sees a bogus opcode.  Its
+ * default case does not advance the event pointer, so selecting a Pikachu
+ * costume that instantiates this accessory can spin forever while unrelated
+ * audio continues running. */
+AObjEvent32 *dPikachuModel_gap_0x59B8_sub_0xB94[5] = {
+	(AObjEvent32 *)dPikachuModel_gap_0x59B8_sub_0xB4C,
+	(AObjEvent32 *)dPikachuModel_gap_0x59B8_sub_0xB74,
 	NULL,
 	NULL,
 	NULL,

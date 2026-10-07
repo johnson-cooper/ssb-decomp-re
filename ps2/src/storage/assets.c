@@ -17,6 +17,10 @@
 #define PACK_NAME "SSB64.DAT"
 
 static int sFd = -1;
+static char sPackPath[300];
+static int sLastSeekRc;
+static int sLastReadGot;
+static int sStreamReopens;
 static PS2PackHeader sHeader;
 static PS2PackRegion *sRegions;
 static uint8_t **sResidentPtr; /* per region: EE copy or NULL */
@@ -27,13 +31,69 @@ static uint32_t sBytesRead;
 static uint32_t sReads;
 static uint32_t sMisses;
 
+static int reopen_pack_stream(void)
+{
+    int new_fd;
+
+    if (sPackPath[0] == '\0')
+        return 0;
+
+    /*
+     * Reopen through the same public filesystem path. This is intentionally
+     * backend-agnostic: a removable/network/MMCE transport that loses one
+     * descriptor can recover without changing drivers or rebooting the IOP.
+     */
+    new_fd = ps2_file_open_read(sPackPath);
+    if (new_fd < 0)
+        return 0;
+
+    if (sFd >= 0)
+        ps2_file_close(sFd);
+    sFd = new_fd;
+    sStreamReopens++;
+    ps2_log("assets: reopened persistent pack stream (%d)", sStreamReopens);
+    return 1;
+}
+
 static int read_exact(void *dst, uint32_t offset, uint32_t size)
 {
-    if (ps2_file_seek(sFd, offset) < 0)
+    extern void ps2_delay_vblanks(int n);
+    int attempt;
+
+    sLastSeekRc = 0;
+    sLastReadGot = 0;
+
+    /*
+     * Every attempt starts from the absolute pack offset. A failed descriptor
+     * is reopened through the same device/path before the next attempt; no
+     * backend swap, IOP reset, or MMCE-specific descriptor handoff occurs.
+     */
+    for (attempt = 0; attempt < 4; attempt++)
     {
-        return 0;
+        sLastSeekRc = ps2_file_seek(sFd, offset);
+        if (sLastSeekRc < 0)
+        {
+            ps2_log("assets: seek failed off=0x%08x rc=%d attempt=%d",
+                    (unsigned)offset, sLastSeekRc, attempt + 1);
+        }
+        else
+        {
+            sLastReadGot = ps2_file_read(sFd, dst, size);
+            if (sLastReadGot == (int)size)
+                return 1;
+
+            ps2_log("assets: short/read fail off=0x%08x want=%u got=%d attempt=%d",
+                    (unsigned)offset, (unsigned)size, sLastReadGot, attempt + 1);
+        }
+
+        if (attempt + 1 < 4)
+        {
+            ps2_delay_vblanks(2);
+            reopen_pack_stream();
+        }
     }
-    return ps2_file_read(sFd, dst, size) == (int)size;
+
+    return 0;
 }
 
 int ps2_assets_init(void)
@@ -46,16 +106,51 @@ int ps2_assets_init(void)
     sema.max_count = 1;
     sReadSema = CreateSema(&sema);
 
-    /* Next to the ELF first. PCSX2's "Run ELF" passes argv[0] with its
-     * backslashes stripped, so for host: also try the host root, which
-     * PCSX2 maps to the ELF's directory. */
-    ps2_storage_path(path, sizeof(path), PACK_NAME);
-    sFd = ps2_file_open_read(path);
-    if (sFd < 0 && ps2_storage_boot_device() == PS2_BOOT_HOST)
+    /*
+     * Wait for the real pack by opening the handle we will keep for the
+     * entire run. Do not probe-open/close it in boot.c and then reopen it:
+     * removable/network/MMCE transports can still be settling, and MMCE in
+     * particular should not be forced through redundant file-open traffic.
+     */
     {
-        ps2_log("assets: %s not found, trying host:%s", path, PACK_NAME);
-        snprintf(path, sizeof(path), "host:%s", PACK_NAME);
-        sFd = ps2_file_open_read(path);
+        extern void ps2_delay_vblanks(int n);
+        int attempt;
+
+        sFd = -1;
+        for (attempt = 0; attempt < 200; attempt++)
+        {
+            ps2_storage_resolve_data_root(PACK_NAME);
+            ps2_storage_path(path, sizeof(path), PACK_NAME);
+            snprintf(sPackPath, sizeof(sPackPath), "%s", path);
+            sFd = ps2_file_open_read(sPackPath);
+
+            /* PCSX2 Run ELF can lose argv[0]'s directory separators. */
+            if (sFd < 0 && ps2_storage_boot_device() == PS2_BOOT_HOST)
+            {
+                snprintf(path, sizeof(path), "host:%s", PACK_NAME);
+                snprintf(sPackPath, sizeof(sPackPath), "%s", path);
+                sFd = ps2_file_open_read(sPackPath);
+            }
+
+            if (sFd >= 0)
+            {
+                ps2_log("assets: persistent %s opened after %d ms", path, attempt * 100);
+                break;
+            }
+
+            if (ps2_storage_data_device() == PS2_BOOT_HOST)
+                break;
+
+            /* Generic massN: brings up USB first. If ~5 s pass without the
+             * pack on any mass slot, add the other local BDM transports to
+             * the same live IOP and keep probing. */
+            if (attempt == 50 && ps2_storage_data_device() == PS2_BOOT_BDM)
+            {
+                ps2_boot_stage("assets: SSB64.DAT not on USB after 5 s; adding other BDM transports", 0);
+                ps2_iop_load_bdm_fallback_transports();
+            }
+            ps2_delay_vblanks(6);
+        }
     }
     if (sFd < 0)
     {
@@ -92,6 +187,7 @@ int ps2_assets_init(void)
                               ? sResidentBlob + (sRegions[i].file_offset - sHeader.resident_offset)
                               : NULL;
     }
+
     ps2_log("assets: %s: %u regions, %u KiB resident, %u KiB total", path, (unsigned)sHeader.region_count,
             (unsigned)(sHeader.resident_bytes >> 10), (unsigned)(sHeader.total_size >> 10));
     return 1;
@@ -161,7 +257,9 @@ void ps2_rom_read(uint32_t rom_addr, void *dst, uint32_t size)
             if (!read_exact(out, r->file_offset + off, n))
             {
                 SignalSema(sReadSema);
-                ps2_panic("asset read failed at 0x%08x (%u bytes)", (unsigned)rom_addr, (unsigned)n);
+                ps2_panic("asset read failed vrom=0x%08x file=0x%08x size=%u got=%d seek=%d reopens=%d",
+                          (unsigned)rom_addr, (unsigned)(r->file_offset + off), (unsigned)n,
+                          sLastReadGot, sLastSeekRc, sStreamReopens);
             }
             SignalSema(sReadSema);
             sBytesRead += n;

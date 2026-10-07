@@ -114,6 +114,7 @@ static struct
     int color_target;  /* FB index, or -1 */
     int zimg_is_z;
     int cimg_is_z;
+    int cimg_offscreen; /* unsupported non-display color image: suppress draws */
 
     uint32_t rdphalf1, rdphalf2;
     int rect_tile;
@@ -678,6 +679,7 @@ typedef struct TexInfo
     float off_s, off_t; /* tile origin in texels */
     float shift_s, shift_t;
     int wrap_s_repeat, wrap_t_repeat;
+    int clamp_s_materialized, clamp_t_materialized;
 } TexInfo;
 
 static int tile_shift_mul(int shift, float *mul)
@@ -701,27 +703,52 @@ static void bind_texture(int tile_index, TexInfo *ti)
     uint32_t tlut_type = (R.om_h >> 14) & 3;
 
     ti->valid = 0;
+    ti->clamp_s_materialized = 0;
+    ti->clamp_t_materialized = 0;
     if (li < 0)
     {
         return;
     }
     memset(&key, 0, sizeof(key));
 
-    /* The RDP clamps to the tile extent first, then wraps with the mask.
-     * When the mask period is smaller than the extent the result is the
-     * mask-sized texture repeated (or mirrored) across the region, so that
-     * is what gets uploaded; clamping only matters when the extent fits. */
+    /*
+     * With a non-zero mask, the RDP can wrap/mirror *inside* the legal
+     * SL/TL..SH/TH tile and still clamp outside that tile.  One repeating GS
+     * period cannot represent both operations.  Keep the mask period as the
+     * source extent and, on a clamped axis, ask texcache to materialize the
+     * complete legal tile before REGION_CLAMP is applied.
+     *
+     * Nintendo's documented example (SH=11, mask=2, mirror+clamp) produces
+     * 0,1,2,3,3,2,1,0,0,1,2,3,3,3...; the first 12 texels are the
+     * materialized masked/mirrored tile and the last value is then clamped.
+     */
     w = ((t->lrs - t->uls) >> 2) + 1;
     h = ((t->lrt - t->ult) >> 2) + 1;
-    ti->wrap_s_repeat = t->masks && (!(t->cms & G_TX_CLAMP) || w > (1 << t->masks));
-    ti->wrap_t_repeat = t->maskt && (!(t->cmt & G_TX_CLAMP) || h > (1 << t->maskt));
-    if (ti->wrap_s_repeat)
-        w = 1 << t->masks;
-    if (ti->wrap_t_repeat)
-        h = 1 << t->maskt;
     if (w <= 0 || h <= 0 || w > 1024 || h > 1024)
     {
         return;
+    }
+
+    ti->wrap_s_repeat = t->masks && (!(t->cms & G_TX_CLAMP) || w > (1 << t->masks));
+    ti->wrap_t_repeat = t->maskt && (!(t->cmt & G_TX_CLAMP) || h > (1 << t->maskt));
+
+    if (ti->wrap_s_repeat)
+    {
+        if (t->cms & G_TX_CLAMP)
+        {
+            key.clamp_width = (uint16_t)w;
+            ti->clamp_s_materialized = 1;
+        }
+        w = 1 << t->masks;
+    }
+    if (ti->wrap_t_repeat)
+    {
+        if (t->cmt & G_TX_CLAMP)
+        {
+            key.clamp_height = (uint16_t)h;
+            ti->clamp_t_materialized = 1;
+        }
+        h = 1 << t->maskt;
     }
 
     /* 32-bit texels are split across TMEM's two halves (RG low, BA high), so
@@ -936,8 +963,8 @@ static void build_mode(DrawMode *dm, int for_rect)
         uint32_t filt = (R.om_h >> 12) & 3; /* 0 point, 2 bilerp, 3 average */
         int lin = (filt != 0) && cyc != G_CYC_COPY;
         const TexInfo *ti = &dm->tex;
-        int wms = ti->wrap_s_repeat ? GSWRAP_REPEAT : GSWRAP_REGION_CLAMP;
-        int wmt = ti->wrap_t_repeat ? GSWRAP_REPEAT : GSWRAP_REGION_CLAMP;
+        int wms = (ti->wrap_s_repeat && !ti->clamp_s_materialized) ? GSWRAP_REPEAT : GSWRAP_REGION_CLAMP;
+        int wmt = (ti->wrap_t_repeat && !ti->clamp_t_materialized) ? GSWRAP_REPEAT : GSWRAP_REGION_CLAMP;
         const GbiTile *t = &R.tiles[(for_rect ? R.rect_tile : R.tex_tile) & 7];
         int maxu = ((t->lrs - t->uls) >> 2);
         int maxv = ((t->lrt - t->ult) >> 2);
@@ -1172,6 +1199,15 @@ static void tri_pass(const GbiVtx *a, const GbiVtx *b, const GbiVtx *c, const Dr
 
 static void tri(int i0, int i1, int i2)
 {
+    /*
+     * The N64 sometimes renders intermediate effects into color images that
+     * are not one of the three VI framebuffers. We do not emulate those
+     * off-screen render targets yet. Drawing those commands into the last
+     * on-screen framebuffer is worse than omitting the unsupported effect:
+     * it produces stray full-width strips/panels and apparent "jitter".
+     */
+    if (R.cimg_offscreen)
+        return;
     if (i0 >= MAX_VTX || i1 >= MAX_VTX || i2 >= MAX_VTX)
         return;
     if (sModeDirty)
@@ -1472,6 +1508,9 @@ static void unpack_fill_color(uint8_t *rgba)
 static void fill_rect(int ulx, int uly, int lrx, int lry)
 {
     uint32_t cyc = R.om_h & (3u << 20);
+
+    if (R.cimg_offscreen)
+        return;
     float x0 = ulx * 0.25f, y0 = uly * 0.25f, x1 = lrx * 0.25f, y1 = lry * 0.25f;
     uint64_t *p;
 
@@ -1608,6 +1647,9 @@ static void snap_leading_edge(float *p0, float p1, float *t0, float t1)
 static void tex_rect(uint32_t w0, uint32_t w1, uint32_t h1, uint32_t h2, int flip)
 {
     uint32_t cyc = R.om_h & (3u << 20);
+
+    if (R.cimg_offscreen)
+        return;
     int lrx = (w0 >> 12) & 0xFFF, lry = w0 & 0xFFF;
     int tile = (w1 >> 24) & 7;
     int ulx = (w1 >> 12) & 0xFFF, uly = w1 & 0xFFF;
@@ -1645,8 +1687,16 @@ static void tex_rect(uint32_t w0, uint32_t w1, uint32_t h1, uint32_t h2, int fli
         dm.gs.prim &= ~((uint64_t)1 << 6); /* no blending in copy mode */
     }
     dm.gs.use_fog = 0;
-    dm.gs.nreg = 3; /* UV, RGBAQ, XYZ2 */
-    dm.gs.prim |= (uint64_t)1 << 8; /* FST: UV in texel units */
+    dm.gs.nreg = 3; /* STQ, RGBAQ, XYZ2 */
+    /*
+     * Texture rectangles can carry small negative S/T offsets when a sprite
+     * moves by a fractional pixel. GS UV is unsigned fixed point, so encoding
+     * those values wrapped them to the far edge of the texture and made
+     * moving sprites (notably the CSS hand cursor) disappear. Use floating
+     * STQ here instead; it preserves signed sub-texel coordinates and lets the
+     * existing CLAMP state do the right thing.
+     */
+    dm.gs.prim &= ~((uint64_t)1 << 8); /* FST=0: STQ */
 
     /* Texel coordinates relative to the bound tile origin. */
     s = s * dm.tex.shift_s - dm.tex.off_s;
@@ -1701,8 +1751,6 @@ static void tex_rect(uint32_t w0, uint32_t w1, uint32_t h1, uint32_t h2, int fli
     {
         GsState st = dm.gs;
 
-        /* A separate state signature (UV sprites) so they never merge into
-         * STQ triangle batches. */
         batch_close();
         if (!sCurValid || memcmp(&sCur, &st, sizeof(st)) != 0)
         {
@@ -1711,12 +1759,12 @@ static void tex_rect(uint32_t w0, uint32_t w1, uint32_t h1, uint32_t h2, int fli
         ps2_pkt_reserve(8);
         p = gPS2Pkt.ptr;
         p[0] = GIFTAG_LO(2, 0, 1, st.prim, GIF_FLG_PACKED, 3);
-        p[1] = (uint64_t)GSR_UV | ((uint64_t)GSR_RGBAQ << 4) | ((uint64_t)GSR_XYZ2 << 8);
+        p[1] = (uint64_t)GSR_ST | ((uint64_t)GSR_RGBAQ << 4) | ((uint64_t)GSR_XYZ2 << 8);
         p += 2;
-        gs_packed_uv(p, (uint32_t)(int32_t)(u0 * 16.0f), (uint32_t)(int32_t)(v0 * 16.0f));
+        gs_packed_stq(p, u0 / (float)dm.tex.bind.gs_w, v0 / (float)dm.tex.bind.gs_h, 1.0f);
         gs_packed_rgba(p + 2, clamp_u8(o.r), clamp_u8(o.g), clamp_u8(o.b), clamp_u8(o.a));
         gs_packed_xyz2(p + 4, (uint32_t)((2048.0f + x0) * 16.0f), (uint32_t)((2048.0f + y0) * 16.0f), z);
-        gs_packed_uv(p + 6, (uint32_t)(int32_t)(u1 * 16.0f), (uint32_t)(int32_t)(v1 * 16.0f));
+        gs_packed_stq(p + 6, u1 / (float)dm.tex.bind.gs_w, v1 / (float)dm.tex.bind.gs_h, 1.0f);
         gs_packed_rgba(p + 8, clamp_u8(o.r), clamp_u8(o.g), clamp_u8(o.b), clamp_u8(o.a));
         gs_packed_xyz2(p + 10, (uint32_t)((2048.0f + x1) * 16.0f), (uint32_t)((2048.0f + y1) * 16.0f), z);
         gPS2Pkt.ptr = p + 12;
@@ -1743,6 +1791,7 @@ static void set_color_image(const void *addr)
 
     batch_close();
     R.cimg_is_z = ps2_gs_is_zbuffer(addr);
+    R.cimg_offscreen = 0;
     if (fb >= 0)
     {
         R.color_target = fb;
@@ -1763,8 +1812,15 @@ static void set_color_image(const void *addr)
     }
     else if (!R.cimg_is_z)
     {
-        /* Off-screen targets are not supported yet; keep drawing into the
-         * current framebuffer (see PS2_PORT_STATUS.md). */
+        /*
+         * Off-screen render targets are not implemented yet. Previously we
+         * silently left FRAME pointing at the last display framebuffer, so
+         * every draw intended for the intermediate image corrupted the
+         * visible frame. Suppress those primitives until the display list
+         * selects a real framebuffer again. State/TMEM commands still run,
+         * so returning to the screen target keeps normal RDP state flow.
+         */
+        R.cimg_offscreen = 1;
     }
     sModeDirty = 1;
 }

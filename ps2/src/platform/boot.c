@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <kernel.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 /* Game side (src/sys/main.c): the N64 boot thread's code. */
@@ -29,46 +30,32 @@ extern void ps2_render_thread_init(void);
 extern void ps2_arena_init(void);
 extern void ps2_overlay_state_init(void);
 
-#define PS2_BOOT_TITLE "Super Smash Bros. 64 - PS2 native port"
-
-/* USB (and MMCE) storage appears asynchronously after its drivers load;
- * wait until a file next to the ELF can be opened (up to ~6 s). */
-static void wait_for_boot_file(const char *name)
-{
-    extern void ps2_delay_vblanks(int n);
-    char path[288];
-    int i, fd = -1;
-
-    ps2_storage_path(path, sizeof(path), name);
-    for (i = 0; i < 60; i++)
-    {
-        fd = open(path, O_RDONLY);
-        if (fd >= 0)
-        {
-            close(fd);
-            ps2_log("boot: %s found after %d ms", path, i * 100);
-            return;
-        }
-        if (ps2_storage_boot_device() == PS2_BOOT_HOST)
-        {
-            break; /* host: is there or not */
-        }
-        ps2_delay_vblanks(6);
-    }
-    ps2_log("boot: %s not found", path);
-}
+#define PS2_BOOT_TITLE "Super Smash Bros. 64 - PS2 native port [UNIFIED-RECOVERY]"
 
 int ps2_main(int argc, char *argv[])
 {
     const PS2MemStats *mem;
+    int bad_data_arg = 0;
+    int i;
 
     ps2_log_init();
     ps2_crash_init();
     ps2_storage_set_boot_path((argc > 0) ? argv[0] : NULL);
+
+    /* Optional explicit asset/log directory. This is deliberately a directory
+     * rather than a device switch: e.g. an ELF may live on mc0: while the
+     * large SSB64.DAT lives on mass0:, udpfs:, MMCE or PFS. */
+    for (i = 1; i < argc; i++)
+    {
+        if (argv[i] != NULL && strncmp(argv[i], "--data=", 7) == 0)
+        {
+            if (!ps2_storage_set_data_path(argv[i] + 7))
+                bad_data_arg = 1;
+        }
+    }
     /* Stage colours (troubleshooting on hardware, see PS2_PORT.md): navy =
-     * started, half-intensity colours = IOP reset and one per IOP module,
-     * blue = GS video init, full-intensity colours = GS init steps, then the
-     * boot log screen, which shows every later stage as text. */
+     * started, half-intensity colours subdivide IOP reset/module bring-up,
+     * blue enters GS init, and after GS init the boot log is shown as text. */
     ps2_boot_stage("started", 0x000080);
     ps2_mem_init();
 
@@ -77,7 +64,10 @@ int ps2_main(int argc, char *argv[])
     ChangeThreadPriority(GetThreadId(), 2);
 
     ps2_log("boot: argv0=%s", (argc > 0 && argv[0] != NULL) ? argv[0] : "(none)");
-    ps2_log("boot: device=%s dir=%s", ps2_storage_device_name(ps2_storage_boot_device()), ps2_storage_boot_dir());
+    ps2_log("boot: launch=%s data=%s dir=%s",
+            ps2_storage_device_name(ps2_storage_launch_device()),
+            ps2_storage_device_name(ps2_storage_data_device()),
+            ps2_storage_boot_dir());
 
     {
         /* Display lists address memory through RSP segments; a real EE
@@ -94,46 +84,65 @@ int ps2_main(int argc, char *argv[])
 
     ps2_boot_stage("IOP reset + modules", 0x800080);
     ps2_iop_init();
-    /* Bring the GS/DMAC up before installing our VBlank ISR.  gsKit resets
-     * and reprograms the GS during init; letting a game-side VBlank handler
-     * run across that transition is unnecessary and can expose launcher/
-     * hardware state that PCSX2's host: path does not reproduce. */
-    ps2_boot_stage("GS video init", 0x0000FF); /* bright blue */
+    /* Initialize the GS before installing the game-side VBlank ISR. gsKit
+     * reprograms GS state during bring-up, so no VBlank callback should run
+     * across that hardware transition. */
+    ps2_boot_stage("GS video init", 0x0000FF);
     ps2_gs_init();
     ps2_vblank_init();
     ps2_gs_boot_screen(PS2_BOOT_TITLE);
 
-    ps2_iop_load_boot_device_drivers(ps2_storage_boot_device());
+    if (bad_data_arg)
+        ps2_panic("invalid --data path; use a supported device directory (for example mass0:/SSB64/)");
+
+    if (ps2_storage_data_device() == PS2_BOOT_UNKNOWN)
+        ps2_panic("unsupported or ambiguous launch/data path: %s", ps2_storage_launch_path());
+
+    if (ps2_iop_load_boot_device_drivers(ps2_storage_data_device()) < 0)
+        ps2_panic("failed to initialize %s storage", ps2_storage_device_name(ps2_storage_data_device()));
+
     ps2_gs_boot_screen(PS2_BOOT_TITLE);
-    wait_for_boot_file("SSB64.DAT");
-    if (ps2_storage_boot_device() != PS2_BOOT_CDROM)
-    {
-        /* crash/panic reports write SSB64.LOG from here on */
-        ps2_log_enable_save(1);
-#if PS2_DEBUG
-        ps2_log_save();
-#endif
-    }
+
     ps2_ultra_threads_init();
     ps2_vi_init();
     ps2_arena_init();
     ps2_overlay_state_init();
-    ps2_input_init();
-    ps2_gs_boot_screen(PS2_BOOT_TITLE);
 
+    /*
+     * Open and validate the asset stream before starting controller clients.
+     * Every device keeps the same filesystem/backend for the lifetime of the
+     * pack. Transient descriptor failures are recovered by reopening the same
+     * path; storage is never switched underneath the game.
+     */
     if (!ps2_assets_init())
     {
         ps2_panic("asset pack not found next to the ELF (%sSSB64.DAT). Run ps2/tools/prepare_assets.sh first.",
                   ps2_storage_boot_dir());
     }
-    ps2_save_init();
-    /* libsd + sdrdrv are loaded here rather than with the base modules so a
-     * problem with them shows up as a log line on screen, not as a solid
-     * colour; without them the game runs silent. */
-    if (ps2_iop_load_audio_drivers() == 0)
+
+    if (ps2_storage_data_device() != PS2_BOOT_CDROM)
     {
-        ps2_audio_init();
+        ps2_log_enable_save(1);
+        ps2_log_save();
     }
+
+    ps2_input_init();
+    ps2_gs_boot_screen(PS2_BOOT_TITLE);
+
+    /* Keep the on-screen boot log truthful. Previously the screen was only
+     * redrawn before save/audio init and after both had completed, so a hang
+     * inside either subsystem misleadingly left "input: ... ready" as the
+     * final visible line. */
+    ps2_log("boot: initializing save backend");
+    ps2_gs_boot_screen(PS2_BOOT_TITLE);
+    ps2_save_init();
+    ps2_log("boot: save backend initialized");
+    ps2_gs_boot_screen(PS2_BOOT_TITLE);
+
+    ps2_log("boot: scheduling audio backend");
+    ps2_audio_init();
+    ps2_gs_boot_screen(PS2_BOOT_TITLE);
+
     ps2_render_thread_init();
 
     mem = ps2_mem_stats();
@@ -142,9 +151,7 @@ int ps2_main(int argc, char *argv[])
     ps2_gs_boot_screen(PS2_BOOT_TITLE);
 
     ps2_log("boot: starting game");
-#if PS2_DEBUG
     ps2_log_save();
-#endif
     /* syMainLoop creates the idle thread (libultra priority 127), which in
      * turn starts the game's main thread; this boot thread then just parks
      * at the lowest priority. */

@@ -1,39 +1,49 @@
 /*
- * IOP bring-up.
+ * IOP bring-up for real launch/data devices.
  *
- * IOP RAM is ~2 MiB and shared with the BIOS modules, so only the drivers the
- * port actually needs are loaded, and boot-device drivers only for the device
- * we were launched from:
+ * The launch device and the data device are intentionally separate.  host:
+ * keeps the ps2link/PCSX2 IOP alive; every other launch starts from a clean
+ * IOP and reconstructs only the stack required by the selected data device.
+ * Exactly one reset happens per boot for BDM devices: once the USB host
+ * driver is running, a second IOP reset leaves the stick unreachable.
  *
- *   always:   iomanX + fileXio      (file access through one API)
- *             sio2man + mtapman + padman   (controllers, multitap)
- *             mcman + mcserv        (memory card saves)
- *   later:    libsd + sdr           (audio, loaded once the GS is up)
- *   mass:     bdm + bdmfs_fatfs + usbd_mini + usbmass_bd_mini
- *   hdd:      ps2dev9 + ps2atad + ps2hdd + ps2fs (+ pfs0: mount)
- *   mmce:     mmceman
- *   host:     nothing - the IOP is NOT reset so ps2link/PCSX2 host: survives
- *
- * No game data ever lives on the IOP.
+ * Base:      iomanX + fileXio + sio2man + mtapman + padman + mcman/mcserv
+ *            + libsd/sdr
+ * USB:       bdm + bdmfs_fatfs + usbd_mini + usbmass_bd_mini
+ * massN:     USB stack first; MX4SIO/iLink/ATA added later only if the
+ *            pack has not appeared (no reset in between)
+ * ATA BDM:   ps2dev9 + bdm + bdmfs_fatfs + ps2atad
+ * MX4SIO:    bdm + bdmfs_fatfs + mx4sio_bd
+ * iLink:     bdm + bdmfs_fatfs + iLinkman + IEEE1394_bd
+ * UDPBD:     ps2dev9 + bdm + bdmfs_fatfs + smap_udpbd(ip=...)
+ * UDPFS:     ps2dev9 + udpfs_smap + udpfs_ministack(ip=...) + udpfs_ioman
+ * APA/PFS:   ps2dev9 + bdm + bdmfs_fatfs + ps2atad + ps2hdd + ps2fs
+ * MMCE:      mmceman
  */
-/* fileXio is only initialised here (it then backs newlib's POSIX I/O). */
 #define NEWLIB_PORT_AWARE
 #include <ps2/platform.h>
 
+#include <ctype.h>
+#include <delaythread.h>
+#include <fcntl.h>
 #include <fileXio_rpc.h>
-#include <kernel.h>
 #include <iopcontrol.h>
 #include <iopheap.h>
+#include <io_common.h>
+#include <kernel.h>
 #include <loadfile.h>
-#include <sbv_patches.h>
 #include <malloc.h>
+#include <sbv_patches.h>
 #include <sifrpc.h>
+#include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
-#define DECLARE_IRX(name)                         \
+#define DECLARE_IRX(name)                                      \
     extern unsigned char name##_irx[] __attribute__((aligned(16))); \
     extern unsigned int size_##name##_irx
 
+DECLARE_IRX(ssb_usb_quiesce);
 DECLARE_IRX(iomanx);
 DECLARE_IRX(filexio);
 DECLARE_IRX(sio2man);
@@ -41,364 +51,510 @@ DECLARE_IRX(mtapman);
 DECLARE_IRX(padman);
 DECLARE_IRX(mcman);
 DECLARE_IRX(mcserv);
+DECLARE_IRX(libsd);
+DECLARE_IRX(sdr);
+DECLARE_IRX(ssb_audio);
+
 DECLARE_IRX(bdm);
 DECLARE_IRX(bdmfs_fatfs);
 DECLARE_IRX(usbd_mini);
 DECLARE_IRX(usbmass_bd_mini);
 DECLARE_IRX(mmceman);
-DECLARE_IRX(libsd);
-DECLARE_IRX(sdr);
+DECLARE_IRX(mmcedrv);
+DECLARE_IRX(ssb_mmce_stream);
+DECLARE_IRX(cdvd);
 
-#define MAX_TRACKED_MODULES 24
+DECLARE_IRX(ps2dev9);
+DECLARE_IRX(ps2atad);
+DECLARE_IRX(mx4sio_bd);
+DECLARE_IRX(iLinkman);
+DECLARE_IRX(IEEE1394_bd);
+DECLARE_IRX(smap_udpbd);
+DECLARE_IRX(udpfs_smap);
+DECLARE_IRX(udpfs_ministack);
+DECLARE_IRX(udpfs_ioman);
+DECLARE_IRX(ps2hdd);
+DECLARE_IRX(ps2fs);
+DECLARE_IRX(secrsif);
+
+#define MAX_TRACKED_MODULES 32
 
 static const char *sLoaded[MAX_TRACKED_MODULES];
 static int sLoadedCount;
 static int sIopWasReset;
 
-typedef int (*IrxPatchFn)(uint8_t *image, unsigned int size);
-
-static uint32_t rd32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static void wr32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16);
-    p[3] = (uint8_t)(v >> 24);
-}
-
-/* `addiu $rt, $zero, 2` or `ori $rt, $zero, 2` */
-static int is_li_2(uint32_t w)
-{
-    uint32_t op = w >> 26;
-
-    return (op == 0x09 || op == 0x0D) && ((w >> 21) & 31) == 0 && ((w >> 16) & 31) != 0 && (w & 0xFFFF) == 2;
-}
-
-/* ps2sdk's sdrdrv (a reimplementation of SCE's SDRDRV 4.0.1) ends its
- * module_start with `return MODULE_REMOVABLE_END` (2).  Only IOP MODLOAD
- * versions newer than 1.2 know that value (ps2sdk loadcore.h); those come
- * with game IOPRP images or newer BIOSes.  After our IOP reset the console's
- * own rom0:MODLOAD is in charge, and an older one treats 2 as "not
- * resident": it unloads the module while its RPC thread, just started, runs
- * from that memory, and the IOP never answers the load RPC.  That is the
- * hang at "IOP: loading sdr" on hardware; PCSX2's BIOS image accepts 2.
- *
- * The fix is to make the module report MODULE_RESIDENT_END (0), which every
- * MODLOAD accepts and which is what the module means anyway (it is never
- * unloaded).  The return follows the module's " Exit rsd_main " Kprintf, so
- * find the code that loads that string's address and patch the first
- * `li v0, 2` after it.  Returns 0 when patched. */
-static int patch_sdr_resident(uint8_t *img, unsigned int size)
-{
-    static const char kMarker[] = "Exit rsd_main";
-    uint32_t phoff, phnum, phentsize, i;
-    uint32_t seg_off = 0, seg_vaddr = 0, seg_size = 0;
-    uint32_t str_off = 0, str_vaddr, lo, hi, w;
-    int found = 0;
-
-    if (size < 0x34 || rd32(img) != 0x464C457Fu) /* "\x7FELF" */
-    {
-        return -1;
-    }
-    phoff = rd32(img + 0x1C);
-    phentsize = (uint32_t)img[0x2A] | ((uint32_t)img[0x2B] << 8);
-    phnum = (uint32_t)img[0x2C] | ((uint32_t)img[0x2D] << 8);
-    for (i = 0; i < phnum; i++)
-    {
-        const uint8_t *ph = img + phoff + i * phentsize;
-
-        if (phoff + (i + 1) * phentsize > size)
-        {
-            return -1;
-        }
-        if (rd32(ph) == 1) /* PT_LOAD */
-        {
-            seg_off = rd32(ph + 4);
-            seg_vaddr = rd32(ph + 8);
-            seg_size = rd32(ph + 16); /* p_filesz */
-            found = 1;
-            break;
-        }
-    }
-    if (!found || seg_off + seg_size > size)
-    {
-        return -1;
-    }
-
-    /* the marker string (back up to its start: it begins with a space) */
-    for (i = seg_off; i + sizeof(kMarker) - 1 <= seg_off + seg_size; i++)
-    {
-        if (memcmp(img + i, kMarker, sizeof(kMarker) - 1) == 0)
-        {
-            str_off = i;
-            while (str_off > seg_off && img[str_off - 1] != '\0')
-            {
-                str_off--;
-            }
-            break;
-        }
-    }
-    if (str_off == 0)
-    {
-        return -1;
-    }
-    str_vaddr = str_off - seg_off + seg_vaddr;
-    lo = str_vaddr & 0xFFFF;
-    hi = ((str_vaddr + 0x8000) >> 16) & 0xFFFF;
-
-    /* addiu $a0, $rs, %lo(str) preceded by lui $rs, %hi(str) */
-    for (i = seg_off; i + 4 <= seg_off + seg_size; i += 4)
-    {
-        uint32_t j, k, rs;
-
-        w = rd32(img + i);
-        if ((w >> 26) != 0x09 || ((w >> 16) & 31) != 4 || (w & 0xFFFF) != lo)
-        {
-            continue;
-        }
-        rs = (w >> 21) & 31;
-        found = 0;
-        for (j = 1; j <= 8 && i >= seg_off + j * 4; j++)
-        {
-            uint32_t l = rd32(img + i - j * 4);
-
-            if ((l >> 26) == 0x0F && ((l >> 16) & 31) == rs && (l & 0xFFFF) == hi)
-            {
-                found = 1;
-                break;
-            }
-        }
-        if (!found)
-        {
-            continue;
-        }
-        /* The Kprintf call follows, then the constant 2 is loaded into the
-         * return register: $v0 directly, or - when module_start is inlined
-         * into _start - a callee-saved register that the shared epilogue
-         * moves to $v0 (often in the delay slot of the jump there).  Take
-         * the first `addiu/ori $rt, $zero, 2` up to and including the delay
-         * slot of the first `jr ra`. */
-        for (k = i + 4; k < i + 4 + 24 * 4 && k + 4 <= seg_off + seg_size; k += 4)
-        {
-            w = rd32(img + k);
-            if (is_li_2(w))
-            {
-                wr32(img + k, w & 0xFFFF0000u);
-                return 0;
-            }
-            if (w == 0x03E00008u) /* jr ra: check its delay slot, then stop */
-            {
-                w = rd32(img + k + 4);
-                if (is_li_2(w))
-                {
-                    wr32(img + k + 4, w & 0xFFFF0000u);
-                    return 0;
-                }
-                break;
-            }
-        }
-    }
-    return -1;
-}
-
-static int load_irx(const char *name, void *buf, unsigned int size, const char *args, int args_len,
-                    IrxPatchFn patch)
+static int load_irx(const char *name, void *buf, unsigned int size, const char *args, int args_len)
 {
     int result = 0;
     int id;
     void *src = buf;
     void *bounce = NULL;
 
-    /* SifExecModuleBuffer() sends the image with a SIF DMA REF tag, and the
-     * DMAC only addresses whole quadwords.  A blob that the embedding step
-     * did not place on a 16-byte boundary reaches the IOP shifted (or not
-     * at all) on hardware, while PCSX2 tolerates it.  Copy such a blob to an
-     * aligned buffer first; modules that need a patch are copied too. */
-    if (((uintptr_t)buf & 15) != 0 || patch != NULL)
+    /* SifExecModuleBuffer sends the module image through SIF DMA. Real
+     * hardware requires the referenced image to be quadword aligned; PCSX2
+     * can hide a misaligned embedded blob. Bounce only when necessary. */
+    if (((uintptr_t)buf & 15u) != 0)
     {
-        bounce = memalign(64, (size + 63) & ~63u);
+        bounce = memalign(64, (size + 63u) & ~63u);
         if (bounce == NULL)
         {
-            ps2_log("IOP: %s: no memory for an aligned copy", name);
+            ps2_log("IOP: %s: no memory for aligned module copy", name);
             return -1;
         }
         memcpy(bounce, buf, size);
         src = bounce;
-        if (((uintptr_t)buf & 15) != 0)
-        {
-            ps2_log("IOP: %s realigned from %p", name, buf);
-        }
-        if (patch != NULL)
-        {
-            if (patch((uint8_t *)bounce, size) != 0)
-            {
-                ps2_log("IOP: %s: patch site not found, not loading it", name);
-                free(bounce);
-                return -1;
-            }
-            ps2_log("IOP: %s patched", name);
-        }
+        ps2_log("IOP: %s realigned from %p", name, buf);
     }
 
     id = SifExecModuleBuffer(src, size, (u32)args_len, args, &result);
     if (bounce != NULL)
-    {
         free(bounce);
-    }
 
-    if (id < 0 || result < 0 || result == 1 /* NO_RESIDENT_END means unloaded */)
+    if (id < 0 || result < 0 || result == 1 /* NO_RESIDENT_END */)
     {
         ps2_log("IOP: %s failed (id=%d res=%d)", name, id, result);
         return -1;
     }
     if (sLoadedCount < MAX_TRACKED_MODULES)
-    {
         sLoaded[sLoadedCount++] = name;
-    }
     ps2_log("IOP: loaded %s (%u bytes)", name, size);
     return 0;
 }
 
-/* Every module gets its own boot-stage colour, shown before the load
- * starts, so a hang inside one SifExecModuleBuffer() call names the module
- * on the TV even while the GS is not set up yet (see PS2_PORT.md,
- * "Troubleshooting on hardware"). */
-#define LOAD_IRX_PATCHED(name, rgb, patch) \
-    (ps2_boot_stage("IOP: loading " #name, (rgb)), load_irx(#name, name##_irx, size_##name##_irx, NULL, 0, (patch)))
-#define LOAD_IRX(name, rgb) LOAD_IRX_PATCHED(name, rgb, NULL)
+#define LOAD_IRX(name) load_irx(#name, name##_irx, size_##name##_irx, NULL, 0)
+#define LOAD_IRX_ARGS(name, args, len) load_irx(#name, name##_irx, size_##name##_irx, args, len)
+#define LOAD_IRX_STAGE(name, rgb) \
+    (ps2_boot_stage("IOP: loading " #name, (rgb)), LOAD_IRX(name))
+
+
+static int load_bdm_core(void)
+{
+    if (LOAD_IRX(bdm) < 0)
+        return -1;
+    if (LOAD_IRX(bdmfs_fatfs) < 0)
+        return -1;
+    return 0;
+}
+
+static int is_ipv4_token(const char *s)
+{
+    int octets = 0;
+    int digits = 0;
+    int value = 0;
+
+    for (; *s != '\0'; s++)
+    {
+        if (*s >= '0' && *s <= '9')
+        {
+            if (++digits > 3)
+                return 0;
+            value = value * 10 + (*s - '0');
+            if (value > 255)
+                return 0;
+        }
+        else if (*s == '.' && digits != 0 && octets < 3)
+        {
+            octets++;
+            digits = 0;
+            value = 0;
+        }
+        else
+        {
+            return 0;
+        }
+    }
+
+    return octets == 3 && digits != 0;
+}
+
+static int read_ip_arg(char *out, size_t out_size)
+{
+    static const char *paths[] = {
+        "mc0:/SYS-CONF/IPCONFIG.DAT",
+        "mc1:/SYS-CONF/IPCONFIG.DAT",
+    };
+    char buf[128];
+    int i;
+
+    for (i = 0; i < (int)(sizeof(paths) / sizeof(paths[0])); i++)
+    {
+        int fd = open(paths[i], O_RDONLY);
+        int n;
+        char *p, *end;
+
+        if (fd < 0)
+            continue;
+        n = (int)read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0)
+            continue;
+        buf[n] = '\0';
+
+        p = buf;
+        while (*p != '\0' && isspace((unsigned char)*p))
+            p++;
+        end = p;
+        while (*end != '\0' && !isspace((unsigned char)*end))
+            end++;
+        *end = '\0';
+
+        if (*p != '\0' && strlen(p) <= 15 && is_ipv4_token(p))
+        {
+            snprintf(out, out_size, "ip=%s", p);
+            ps2_log("IOP: network IP from %s: %s", paths[i], p);
+            return 1;
+        }
+    }
+
+    ps2_log("IOP: network device needs mc?:/SYS-CONF/IPCONFIG.DAT");
+    return 0;
+}
+
+static int mount_hdd_partition(void)
+{
+    const char *source = ps2_storage_hdd_mount_source();
+    int attempt;
+    int r = -1;
+
+    if (source == NULL || source[0] == '\0')
+    {
+        ps2_log("IOP: bare pfs: path has no APA partition to remount");
+        return -1;
+    }
+
+    for (attempt = 0; attempt < 40; attempt++)
+    {
+        r = fileXioMount("pfs0:", source, FIO_MT_RDWR);
+        if (r >= 0)
+        {
+            ps2_log("IOP: mounted %s on pfs0:", source);
+            return 0;
+        }
+        DelayThread(250 * 1000);
+    }
+
+    ps2_log("IOP: failed to mount %s on pfs0: (%d)", source, r);
+    return -1;
+}
+
+/*
+ * A launcher that used USB leaves its OHCI controller running, and PS2SDK's
+ * usbd does not stop it on IOP reboot. It then keeps DMAing into IOP RAM
+ * while the new kernel boots, which hung our reset from some launchers. Halt
+ * it from inside the inherited IOP first; the module is a no-op when USB was
+ * never enabled and never stays resident.
+ */
+static void quiesce_inherited_usb(void)
+{
+    int result = 0;
+    int id;
+
+    ps2_boot_stage("IOP: stopping inherited USB controller", 0xFF8000);
+    SifLoadFileInit();
+    SifInitIopHeap();
+    sbv_patch_enable_lmb();
+    id = SifExecModuleBuffer(ssb_usb_quiesce_irx, size_ssb_usb_quiesce_irx, 0, NULL, &result);
+    SifExitIopHeap();
+    SifLoadFileExit();
+    ps2_log("IOP: inherited USB quiesce id=%d res=%d", id, result);
+}
 
 void ps2_iop_init(void)
 {
-    PS2BootDevice dev = ps2_storage_boot_device();
+    int preserve_iop = ps2_storage_requires_iop_preserve();
+
+    sLoadedCount = 0;
+    sIopWasReset = 0;
 
     SifInitRpc(0);
 
-    /* PCSX2 normally boots this port from host:, so it never exercises the
-     * IOP reboot below.  Real hardware usually boots from mass:/mc:/mmce:.
-     *
-     * stdout/stderr use an IOP RPC by default in ps2sdk/newlib.  Do not print
-     * while the IOP is being rebooted or while its RPC servers are being
-     * rebuilt: a stale console RPC can wait forever on hardware.  ps2_log()
-     * still records every line in RAM while console mirroring is disabled.
-     *
-     * The extra colours deliberately subdivide the old magenta "IOP" stage,
-     * so if hardware still stops here the visible colour identifies exactly
-     * which operation did not return. */
-    if (dev != PS2_BOOT_HOST)
+    /* host: and bare inherited pfsN: paths depend on launcher-owned IOP
+     * state. Every reconstructible transport, including generic massN:,
+     * starts from a clean IOP. Disable stdout mirroring before that reset so a stale
+     * console RPC cannot deadlock real hardware. */
+    if (!preserve_iop)
     {
         ps2_log_console(0);
-        ps2_boot_stage("IOP: reset request", 0x800080);       /* magenta */
+        quiesce_inherited_usb();
+        ps2_boot_stage("IOP: reset request", 0xC0C000);
         while (!SifIopReset("", 0))
         {
         }
         while (!SifIopSync())
         {
         }
-        ps2_boot_stage("IOP: reset synced", 0x804000);        /* orange */
+        ps2_boot_stage("IOP: reset synced", 0x804000);
         SifInitRpc(0);
         sIopWasReset = 1;
     }
 
-    ps2_boot_stage("IOP: RPC + loader", 0x808000);            /* yellow */
+    ps2_boot_stage("IOP: RPC + loader", 0x808000);
     SifLoadFileInit();
     SifInitIopHeap();
 
-    /* Allow SifExecModuleBuffer on every BIOS revision. */
     sbv_patch_enable_lmb();
     sbv_patch_disable_prefix_check();
+    if (sIopWasReset)
+        sbv_patch_fileio();
 
-    if (LOAD_IRX(iomanx, 0x406000) < 0 ||   /* olive */
-        LOAD_IRX(filexio, 0x408000) < 0)    /* yellow-green */
+    if (sIopWasReset)
     {
-        goto module_failure;
+        if (LOAD_IRX_STAGE(iomanx, 0x406000) < 0 ||
+            LOAD_IRX_STAGE(filexio, 0x408000) < 0)
+            goto module_failure;
     }
-    ps2_boot_stage("IOP: fileXio RPC", 0x60A000); /* lime */
-    if (fileXioInit() < 0)
+    else
     {
-        goto module_failure;
-    }
-
-    if (LOAD_IRX(sio2man, 0x008000) < 0 ||  /* green */
-        LOAD_IRX(mtapman, 0x006020) < 0 ||  /* dark green */
-        LOAD_IRX(padman, 0x404040) < 0 ||   /* grey */
-        LOAD_IRX(mcman, 0x804040) < 0 ||    /* pink */
-        LOAD_IRX(mcserv, 0x402000) < 0)     /* brown */
-    {
-        goto module_failure;
+        /* Duplicate module loads can be rejected when preserving a launcher
+         * IOP; that is not fatal because the inherited services may already
+         * be resident. */
+        LOAD_IRX_STAGE(iomanx, 0x406000);
+        LOAD_IRX_STAGE(filexio, 0x408000);
     }
 
-    /* The sound drivers (libsd + sdrdrv) are loaded later, once the GS is up
-     * and the boot log is on screen: see ps2_iop_load_audio_drivers(). */
+    ps2_boot_stage("IOP: fileXio RPC", 0x60A000);
+    if (fileXioInit() < 0 && sIopWasReset)
+        goto module_failure;
 
-    /* Keep printf mirroring disabled after a real-hardware IOP reboot.
-     * Even with fileXio restored, stdout may still reference launcher/RPC
-     * state that existed before the reset.  PCSX2's normal host: path never
-     * reboots the IOP, so leave console logging enabled there only.
-     *
-     * ps2_log() still records every line in EE RAM, and hardware can save
-     * that history to SSB64.LOG once the boot device is mounted. */
+    if (sIopWasReset)
+    {
+        if (LOAD_IRX_STAGE(sio2man, 0x008000) < 0 ||
+            LOAD_IRX_STAGE(mtapman, 0x006020) < 0 ||
+            LOAD_IRX_STAGE(padman, 0x404040) < 0 ||
+            LOAD_IRX_STAGE(mcman, 0x804040) < 0 ||
+            LOAD_IRX_STAGE(mcserv, 0x402000) < 0)
+            goto module_failure;
+    }
+    else
+    {
+        LOAD_IRX_STAGE(sio2man, 0x008000);
+        LOAD_IRX_STAGE(mtapman, 0x006020);
+        LOAD_IRX_STAGE(padman, 0x404040);
+        LOAD_IRX_STAGE(mcman, 0x804040);
+        LOAD_IRX_STAGE(mcserv, 0x402000);
+    }
+
+    /* libsd is required by the dedicated ssb_audio server but audio itself
+     * is optional. Do not fail the whole boot if the sound driver is absent. */
+    LOAD_IRX_STAGE(libsd, 0x008060);
+
     if (!sIopWasReset)
-    {
         ps2_log_console(1);
-    }
-    ps2_log("IOP: %s, %d modules", sIopWasReset ? "reset" : "kept (host boot)", sLoadedCount);
+
+    ps2_log("IOP: %s, %d base modules",
+            sIopWasReset ? "reset" : "kept (inherited filesystem)", sLoadedCount);
     return;
 
 module_failure:
-    /* Keep this path independent of printf/file I/O: those services are the
-     * very thing that may have failed.  A solid red screen is therefore an
-     * unambiguous base-module failure instead of another possible deadlock. */
     ps2_log_console(0);
     ps2_boot_stage("IOP: module failure", 0x800000);
     for (;;)
-    {
         SleepThread();
-    }
 }
 
-int ps2_iop_load_audio_drivers(void)
+int ps2_iop_mmce_prepare_runtime_stream(void)
 {
-    /* Audio is optional: a failure here leaves the game silent instead of
-     * stopping the boot. */
-    if (LOAD_IRX(libsd, 0x008060) < 0 || LOAD_IRX_PATCHED(sdr, 0x006080, patch_sdr_resident) < 0)
-    {
-        ps2_log("IOP: sound drivers unavailable; audio stays silent");
+    if (ps2_storage_data_device() != PS2_BOOT_MMCE)
         return -1;
-    }
+
+    /*
+     * MMCEMAN is the setup/filesystem driver. MMCEDRV is explicitly the MMCE
+     * project's in-game streaming driver. Preserve the card-side DAT handle
+     * across one deliberate reset, then rebuild the final IOP before the EE
+     * controller client is initialized.
+     *
+     * Loading MMCEDRV beside MMCEMAN is not safe: both install SIO2MAN hooks.
+     * The reset is what discards MMCEMAN's hook without issuing FS_CLOSE to
+     * the card-side descriptor.
+     */
+    ps2_log("IOP: MMCE setup complete; rebuilding final in-game IOP");
+
+    fileXioExit();
+    SifExitIopHeap();
+    SifLoadFileExit();
+
+    while (!SifIopReset("", 0)) {}
+    while (!SifIopSync()) {}
+
+    SifInitRpc(0);
+    SifLoadFileInit();
+    SifInitIopHeap();
+
+    sbv_patch_enable_lmb();
+    sbv_patch_disable_prefix_check();
+    sbv_patch_fileio();
+
+    sLoadedCount = 0;
+    sIopWasReset = 1;
+
+    if (LOAD_IRX(iomanx) < 0 || LOAD_IRX(filexio) < 0)
+        return -1;
+    if (fileXioInit() < 0)
+        return -1;
+
+    /*
+     * MMCEDRV must hook SIO2MAN before PAD/MEMCARD modules import it. The
+     * bridge then exposes MMCEDRV through the same file-like API used by the
+     * asset manager. Normal controller/save clients are loaded afterwards.
+     */
+    if (LOAD_IRX(sio2man) < 0 ||
+        LOAD_IRX(mmcedrv) < 0 ||
+        LOAD_IRX(ssb_mmce_stream) < 0)
+        return -1;
+
+    if (LOAD_IRX(mtapman) < 0 ||
+        LOAD_IRX(padman) < 0 ||
+        LOAD_IRX(mcman) < 0 ||
+        LOAD_IRX(mcserv) < 0 ||
+        LOAD_IRX(libsd) < 0)
+        return -1;
+
+    ps2_log("IOP: final MMCE game stack ready (MMCEDRV before PAD/MC)");
     return 0;
 }
 
-void ps2_iop_load_boot_device_drivers(PS2BootDevice dev)
+int ps2_iop_load_audio_driver(void)
 {
+    /*
+     * Do not use sdrdrv here. Real-hardware testing proved that the SDR client
+     * can poison the shared SIF RPC path and stall later storage traffic.
+     * ssb_audio is a tiny purpose-built server exposing only the libsd
+     * operations this port needs (init, batched register writes, sample DMA,
+     * and optional readback).
+     */
+    if (ps2_iop_module_loaded("ssb_audio"))
+        return 0;
+
+    ps2_log("IOP: starting dedicated ssb_audio server");
+    return LOAD_IRX_STAGE(ssb_audio, 0x006080);
+}
+
+int ps2_iop_load_boot_device_drivers(PS2BootDevice dev)
+{
+    char ip_arg[24];
+
     switch (dev)
     {
-    case PS2_BOOT_MASS:
-    case PS2_BOOT_UNKNOWN: /* unrecognised launcher path: USB is the best guess */
-        /* USB mass storage enumerates asynchronously; boot.c waits for the
-         * asset pack to become visible. */
-        LOAD_IRX(bdm, 0x200060);
-        LOAD_IRX(bdmfs_fatfs, 0x400060);
-        LOAD_IRX(usbd_mini, 0x600060);
-        LOAD_IRX(usbmass_bd_mini, 0x800060);
-        break;
+    case PS2_BOOT_HOST:
+    case PS2_BOOT_MC:
+        return 0;
+
+    case PS2_BOOT_BDM:
+        /* Generic massN: does not say which transport backs it. USB is by
+         * far the common case, so bring it up first; a missing USB driver is
+         * not fatal because ps2_iop_load_bdm_fallback_transports() can still
+         * add the other local transports without resetting the IOP. */
+        if (load_bdm_core() < 0)
+            return -1;
+        if (LOAD_IRX(usbd_mini) < 0 || LOAD_IRX(usbmass_bd_mini) < 0)
+            ps2_log("IOP: USB mass storage unavailable; other BDM transports remain");
+        return 0;
+
+    case PS2_BOOT_CDROM:
+        return LOAD_IRX(cdvd);
+
+    case PS2_BOOT_USB:
+        if (load_bdm_core() < 0 || LOAD_IRX(usbd_mini) < 0 || LOAD_IRX(usbmass_bd_mini) < 0)
+            return -1;
+        return 0;
+
+    case PS2_BOOT_ATA:
+        if (LOAD_IRX(ps2dev9) < 0 || load_bdm_core() < 0 || LOAD_IRX(ps2atad) < 0)
+            return -1;
+        return 0;
+
+    case PS2_BOOT_MX4SIO:
+        if (load_bdm_core() < 0 || LOAD_IRX(mx4sio_bd) < 0)
+            return -1;
+        return 0;
+
+    case PS2_BOOT_ILINK:
+        if (load_bdm_core() < 0 || LOAD_IRX(iLinkman) < 0 || LOAD_IRX(IEEE1394_bd) < 0)
+            return -1;
+        return 0;
+
+    case PS2_BOOT_UDPBD:
+        if (LOAD_IRX(ps2dev9) < 0 || load_bdm_core() < 0)
+            return -1;
+        if (!read_ip_arg(ip_arg, sizeof(ip_arg)))
+            return -1;
+        return LOAD_IRX_ARGS(smap_udpbd, ip_arg, (int)strlen(ip_arg) + 1);
+
+    case PS2_BOOT_UDPFS:
+        if (LOAD_IRX(ps2dev9) < 0)
+            return -1;
+        if (!read_ip_arg(ip_arg, sizeof(ip_arg)))
+            return -1;
+        if (LOAD_IRX(udpfs_smap) < 0)
+            return -1;
+        if (LOAD_IRX_ARGS(udpfs_ministack, ip_arg, (int)strlen(ip_arg) + 1) < 0)
+            return -1;
+        if (LOAD_IRX(udpfs_ioman) < 0)
+            return -1;
+        return 0;
 
     case PS2_BOOT_MMCE:
-        LOAD_IRX(mmceman, 0x600060);
-        break;
+        return LOAD_IRX(mmceman);
 
     case PS2_BOOT_HDD:
-        /* HDD boot needs dev9/atad/hdd/pfs plus a partition mount; not yet
-         * wired up (see PS2_PORT_STATUS.md). */
-        ps2_log("IOP: HDD boot drivers not implemented yet");
-        break;
+    {
+        static char hdd_args[] = "-o\0" "4\0" "-n\0" "20";
+        static char pfs_args[] = "-o\0" "10\0" "-n\0" "40";
 
-    default:
-        break;
+        /* A bare pfsN: data path has no APA partition name to remount.  It is
+         * valid only when bootpath.c requested that the launcher's IOP/mount
+         * be preserved; in that case the filesystem is already ready. */
+        if (ps2_storage_hdd_mount_source()[0] == '\0')
+        {
+            if (ps2_storage_requires_iop_preserve())
+            {
+                ps2_log("IOP: using inherited PFS mount");
+                return 0;
+            }
+            return -1;
+        }
+
+        if (LOAD_IRX(ps2dev9) < 0 || load_bdm_core() < 0 || LOAD_IRX(ps2atad) < 0)
+            return -1;
+
+        /* Proven launcHER/OSDMenu ordering: ATAD needs a short settle before
+         * the APA driver probes the disk on real hardware. */
+        sleep(1);
+
+        if (LOAD_IRX_ARGS(ps2hdd, hdd_args, sizeof(hdd_args)) < 0)
+            return -1;
+        if (LOAD_IRX_ARGS(ps2fs, pfs_args, sizeof(pfs_args)) < 0)
+            return -1;
+        if (LOAD_IRX(secrsif) < 0)
+            return -1;
+        return mount_hdd_partition();
     }
+
+    case PS2_BOOT_UNKNOWN:
+    default:
+        ps2_log("IOP: unsupported/ambiguous data device; refusing USB fallback");
+        return -1;
+    }
+}
+
+int ps2_iop_load_bdm_fallback_transports(void)
+{
+    static int sDone;
+
+    if (ps2_storage_data_device() != PS2_BOOT_BDM || sDone)
+        return 0;
+    sDone = 1;
+
+    /* Called only when the pack has not appeared on USB. These are added to
+     * the live BDM stack -- never via an IOP reset -- and each one is
+     * optional: hardware that is not present simply fails to load. */
+    ps2_log("IOP: adding iLink/ATA/MX4SIO BDM transports for massN:");
+    if (LOAD_IRX(iLinkman) >= 0)
+        LOAD_IRX(IEEE1394_bd);
+    if (LOAD_IRX(ps2dev9) >= 0 && LOAD_IRX(ps2atad) >= 0)
+        sleep(1);
+    LOAD_IRX(mx4sio_bd);
+    return 1;
 }
 
 int ps2_iop_module_loaded(const char *name)
@@ -408,9 +564,7 @@ int ps2_iop_module_loaded(const char *name)
     for (i = 0; i < sLoadedCount; i++)
     {
         if (strcmp(sLoaded[i], name) == 0)
-        {
             return 1;
-        }
     }
     return 0;
 }

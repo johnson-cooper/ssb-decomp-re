@@ -108,16 +108,39 @@ void ps2_vblank_set_event(struct OSMesgQueue_s *mq, void *msg, uint32_t retrace_
 typedef enum PS2BootDevice
 {
     PS2_BOOT_UNKNOWN,
-    PS2_BOOT_HOST,   /* host: (ps2link / PCSX2 host fs) */
-    PS2_BOOT_MASS,   /* mass0:/mass1: (USB or other BDM) */
-    PS2_BOOT_MC,     /* mc0:/mc1: */
-    PS2_BOOT_HDD,    /* hdd0:/pfs: */
-    PS2_BOOT_MMCE,   /* mmce0:/mmce1: */
-    PS2_BOOT_CDROM   /* cdrom0: */
+    PS2_BOOT_HOST,       /* host: (ps2link / PCSX2 host fs) */
+    PS2_BOOT_BDM,        /* generic massN: (transport found by probing) */
+    PS2_BOOT_USB,        /* explicit usbN: transport identity */
+    PS2_BOOT_MC,         /* mc0:/mc1: */
+    PS2_BOOT_ATA,        /* ata: BDM (internal/exFAT) */
+    PS2_BOOT_MX4SIO,     /* mx4sio: BDM */
+    PS2_BOOT_ILINK,      /* ilink: BDM */
+    PS2_BOOT_UDPBD,      /* udpbd: network block device */
+    PS2_BOOT_UDPFS,      /* udpfs: network filesystem */
+    PS2_BOOT_HDD,        /* APA/PFS hdd0:<partition>:pfs:/ */
+    PS2_BOOT_MMCE,       /* mmce0:/mmce1: */
+    PS2_BOOT_CDROM       /* cdrom0: */
 } PS2BootDevice;
 
+/* argv[0] selects the launch device. By default assets/logs live beside the
+ * ELF, but --data=<directory> can select another supported device (required
+ * for practical mc: launches because SSB64.DAT is larger than an 8 MiB card). */
 void ps2_storage_set_boot_path(const char *argv0);
+int ps2_storage_set_data_path(const char *path);
+PS2BootDevice ps2_storage_launch_device(void);
+PS2BootDevice ps2_storage_data_device(void);
+/* Backwards-compatible alias used by older platform code: returns data device. */
 PS2BootDevice ps2_storage_boot_device(void);
+const char *ps2_storage_launch_path(void);
+const char *ps2_storage_hdd_mount_source(void);
+/* True when the selected data path depends on an inherited IOP filesystem
+ * (host:, or a bare pfsN: mount whose transport/source cannot be
+ * reconstructed from argv[0]). */
+int ps2_storage_requires_iop_preserve(void);
+/* Resolve BDM launch paths (generic massN: and typed usb/ata/mx4sio/ilink/
+ * udpbd identities) to the actual massN: filesystem that contains
+ * probe_name. */
+int ps2_storage_resolve_data_root(const char *probe_name);
 int ps2_video_progressive(void);         /* 1 = 240p (ELF name contains "240p"), 0 = 480i */
 
 /* Boot-stage marker: shows a solid background colour (GS BGCOLOR with both
@@ -144,6 +167,7 @@ int ps2_file_open_read(const char *path);
 int ps2_file_read(int fd, void *dst, uint32_t size);
 int ps2_file_seek(int fd, uint32_t offset);
 int ps2_file_size(int fd);
+int ps2_file_mmce_enter_runtime_stream(int fd);
 void ps2_file_close(int fd);
 
 /* ------------------------------------------------------------------ */
@@ -151,7 +175,11 @@ void ps2_file_close(int fd);
 /* ------------------------------------------------------------------ */
 
 void ps2_iop_init(void);                 /* reset IOP + load base modules */
-void ps2_iop_load_boot_device_drivers(PS2BootDevice dev);
+int ps2_iop_load_boot_device_drivers(PS2BootDevice dev);
+/* massN: only: add non-USB BDM transports to the live stack (once, no reset). */
+int ps2_iop_load_bdm_fallback_transports(void);
+int ps2_iop_load_audio_driver(void); /* deferred SDR server; safe to call after storage/input */
+int ps2_iop_mmce_prepare_runtime_stream(void);
 int  ps2_iop_load_audio_drivers(void);    /* libsd + sdr; 0 on success */
 int  ps2_iop_module_loaded(const char *name);
 int  ps2_iop_module_count(void);

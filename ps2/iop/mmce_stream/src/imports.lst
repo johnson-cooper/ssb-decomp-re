@@ -1,0 +1,16 @@
+iomanX_IMPORTS_start
+I_iomanX_AddDrv
+I_iomanX_DelDrv
+iomanX_IMPORTS_end
+
+loadcore_IMPORTS_start
+I_GetLoadcoreInternalData
+loadcore_IMPORTS_end
+
+stdio_IMPORTS_start
+I_printf
+stdio_IMPORTS_end
+
+thbase_IMPORTS_start
+I_DelayThread
+thbase_IMPORTS_end

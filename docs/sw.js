@@ -1,6 +1,6 @@
 // Offline cache for the builder's own static files only. The ROM and the
 // generated DAT are never cached (they are not fetched over the network).
-const CACHE = "ssb64-builder-v2";
+const CACHE = "ssb64-builder-v3";
 const FILES = [
   "./",
   "index.html",

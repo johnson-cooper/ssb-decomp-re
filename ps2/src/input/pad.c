@@ -12,9 +12,11 @@
 #include <ps2/platform.h>
 #include <ps2/input.h>
 
+#include <delaythread.h>
 #include <kernel.h>
 #include <libmtap.h>
 #include <libpad.h>
+#include <sifrpc.h>
 #include <string.h>
 
 /* libpad buttons (active-low in padButtonStatus.btns) */
@@ -113,14 +115,36 @@ static void assign_slots(void)
 
 static void setup_pad_mode(PadSlot *s);
 
+static int detect_multitap(int port)
+{
+    int slots;
+
+    if (mtapPortOpen(port) != 1 || mtapGetConnection(port) != 1)
+    {
+        mtapPortClose(port);
+        return 0;
+    }
+
+    /* mtapman can successfully probe a plain controller port and still
+     * report one available slot. A real multitap exposes multiple slots;
+     * require that before remapping players 2-4 onto the port. */
+    slots = padGetSlotMax(port);
+    if (slots <= 1)
+    {
+        mtapPortClose(port);
+        return 0;
+    }
+    return 1;
+}
+
 void ps2_input_init(void)
 {
     int i;
 
-    padInit(0);
     mtapInit();
-    sMtap[0] = (mtapPortOpen(0) == 1) && (mtapGetConnection(0) == 1);
-    sMtap[1] = (mtapPortOpen(1) == 1) && (mtapGetConnection(1) == 1);
+    padInit(0);
+    sMtap[0] = detect_multitap(0);
+    sMtap[1] = detect_multitap(1);
     assign_slots();
 
     for (i = 0; i < PS2_INPUT_MAX_PLAYERS; i++)

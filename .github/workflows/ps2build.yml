@@ -1,0 +1,210 @@
+name: Build PS2 (ps2build)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build SSB64 PS2 ELF
+    runs-on: ubuntu-latest
+    env:
+      PS2BUILD_HOME: ${{ github.workspace }}/.ps2dev
+      PS2DEV_INSTALL_DIR: ${{ github.workspace }}/.ps2dev
+      GODEBUG: http2client=0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore ps2build SDK cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ps2dev
+          key: ps2dev-${{ runner.os }}-ssb64-v1-${{ github.run_id }}
+          restore-keys: |
+            ps2dev-${{ runner.os }}-ssb64-v1-
+
+      - name: Install ps2build + PS2 SDK
+        id: sdk1
+        continue-on-error: true
+        uses: techwritescode/setup-sdk@master
+        with:
+          ps2dev: ${{ github.workspace }}/.ps2dev
+
+      - name: Retry ps2build SDK install
+        if: steps.sdk1.outcome == 'failure'
+        uses: techwritescode/setup-sdk@master
+        with:
+          ps2dev: ${{ github.workspace }}/.ps2dev
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$PS2BUILD_HOME/ps2build" --version
+          "$PS2BUILD_HOME/toolchain/ee/bin/mips64r5900el-ps2-elf-gcc" --version | head -1
+
+      - name: Generate ROM-independent linker symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The ELF needs relocData IDs/offset symbols, but copyrighted game
+          # data must not be present in CI. Build the compile/link interface
+          # from the committed relocation descriptions only.
+          python3 tools/genRelocSymbols.py \
+            tools/relocFileDescriptions.us.txt \
+            include/reloc_data.us.h \
+            symbols/reloc_data_symbols.us.txt \
+            --converted-files ""
+
+          test -s include/reloc_data.us.h
+          test -s symbols/reloc_data_symbols.us.txt
+
+      - name: Generate staff roll data
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONUTF8=1
+          python3 tools/creditsTextConverter.py src/credits/staff.credits.us.txt -titleFont --out-dir src/credits
+          python3 tools/creditsTextConverter.py src/credits/titles.credits.us.txt -titleFont --out-dir src/credits
+          python3 tools/creditsTextConverter.py src/credits/info.credits.us.txt -paragraphFont -multiline --out-dir src/credits
+          python3 tools/creditsTextConverter.py src/credits/companies.credits.us.txt -paragraphFont --out-dir src/credits
+
+      - name: Build native PS2 port
+        shell: bash
+        working-directory: ps2
+        run: |
+          set -euo pipefail
+          "$PS2BUILD_HOME/ps2build" build 2>&1 | tee build.log
+
+      - name: Verify ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          elf="ps2/build/bin/ssb64.elf"
+          test -s "$elf"
+          ls -lh "$elf"
+          "$PS2BUILD_HOME/toolchain/ee/bin/mips64r5900el-ps2-elf-readelf" -h "$elf"
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cp ps2/build/bin/ssb64.elf artifacts/SSB64.ELF
+          # The executable selects native NTSC 240p when argv[0] contains
+          # "240p". Ship the exact same binary under that name so hardware
+          # tests can isolate interlaced-field presentation artifacts without
+          # changing renderer/audio code between candidates.
+          cp ps2/build/bin/ssb64.elf artifacts/SSB64-240p.ELF
+
+          if [ -f ps2/build/obj/ssb64/ssb64.unstripped.elf ]; then
+            cp ps2/build/obj/ssb64/ssb64.unstripped.elf artifacts/SSB64-unstripped.ELF
+          fi
+          if [ -f ps2/build/obj/ssb64/ssb64.map ]; then
+            cp ps2/build/obj/ssb64/ssb64.map artifacts/SSB64.map
+          fi
+          cp ps2/build.log artifacts/build.log
+
+          cat > artifacts/README.txt <<'EOF'
+          SSB64 native PS2 port - automated ps2build artifact
+
+          SSB64.ELF is the standard 480i bootable PS2 executable.
+          SSB64-240p.ELF is the same build with native 240p selected by its
+          filename. It is intended for displays/capture chains that accept 240p.
+
+          SSB64.DAT is intentionally NOT included. It contains data generated
+          from a user's own Super Smash Bros. 64 US ROM and must be built
+          locally with:
+
+              ps2/tools/prepare_assets.sh
+
+          Put SSB64.DAT beside SSB64.ELF (or use --data=<directory>).
+          EOF
+
+          sha256sum artifacts/SSB64.ELF > artifacts/SHA256SUMS.txt
+          sha256sum artifacts/SSB64-240p.ELF >> artifacts/SHA256SUMS.txt
+          if [ -f artifacts/SSB64-unstripped.ELF ]; then
+            sha256sum artifacts/SSB64-unstripped.ELF >> artifacts/SHA256SUMS.txt
+          fi
+          cat artifacts/SHA256SUMS.txt
+          ls -lh artifacts/
+
+      - name: Upload PS2 build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssb64-ps2-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish nightly release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download PS2 build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ssb64-ps2-${{ github.sha }}
+          path: artifacts
+
+      - name: Publish nightly release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          short_sha="${GITHUB_SHA::7}"
+          nightly_tag="nightly-$short_sha"
+          built_at="$(date -u +'%Y-%m-%d %H:%M UTC')"
+
+          {
+            echo 'Automated development build from `main`.'
+            echo
+            echo "Commit: [\`$short_sha\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})"
+            echo "Built: $built_at"
+            echo
+            echo '`SSB64.DAT` is intentionally not included. Generate it locally from your own'
+            echo 'Super Smash Bros. 64 US ROM with `ps2/tools/prepare_assets.sh`, then place'
+            echo 'it beside `SSB64.ELF` or supply `--data=<directory>`.'
+          } > nightly-notes.md
+
+          # Remove the superseded rolling-nightly experiment if it still exists.
+          # Per-commit tags avoid force-moving a tag through workflow-changing
+          # commits, which GitHub correctly blocks for the Actions app token.
+          gh release delete nightly --cleanup-tag --yes >/dev/null 2>&1 || true
+
+          if gh release view "$nightly_tag" >/dev/null 2>&1; then
+            gh release edit "$nightly_tag" \
+              --title "Nightly $short_sha" \
+              --prerelease \
+              --notes-file nightly-notes.md
+          else
+            gh release create "$nightly_tag" \
+              --target "$GITHUB_SHA" \
+              --title "Nightly $short_sha" \
+              --prerelease \
+              --notes-file nightly-notes.md
+          fi
+
+          gh release upload "$nightly_tag" artifacts/* --clobber

@@ -13,6 +13,93 @@
 project: ssb64
 
 targets:
+  # Real-device IOP modules that are not guaranteed to exist in the
+  # ps2build package set are built from the vendored, pinned sources below.
+  - name: ata_bd
+    type: iop
+    sources: [iop/ata_bd/src/ps2atad.c]
+    include_dirs: [iop/ata_bd/src]
+    headers: &iop_headers [common, startup, stdio, ioman, iomanx, intrman, excepman, loadcore, sysmem, sysclib, threadman, timrman, dmacman, heaplib, sifcmd, sifman, modload, cdvd, dev9, smap, netman, bdm, usbd, sio2man, padman, mcman, secrman, sior, atad, libsd, spu2, vblank, poweroff, filexio]
+    defines: [ATA_USE_DEV9=1, ATA_GAMESTAR_WORKAROUND=1, ATA_ENABLE_BDM=1]
+    imports_lst: iop/ata_bd/src/imports.lst
+    exports_tab: iop/ata_bd/src/exports.tab
+
+  - name: smap_udpbd
+    type: iop
+    sources: [iop/smap_udpbd/src/main.c, iop/smap_udpbd/src/smap.c, iop/smap_udpbd/src/xfer.c, iop/smap_udpbd/src/ministack.c, iop/smap_udpbd/src/udpbd.c, iop/smap_udpbd/src/udptty.c]
+    include_dirs: [iop/smap_udpbd/src, iop/smap_udpbd/src/include]
+    headers: *iop_headers
+    cflags: [-mno-check-zero-division]
+    imports_lst: iop/smap_udpbd/src/imports.lst
+    exports_tab: iop/smap_udpbd/src/exports.tab
+
+  - name: udpfs_smap
+    type: iop
+    sources: [iop/udpfs_smap/src/main.c, iop/udpfs_smap/src/smap.c, iop/udpfs_smap/src/xfer.c]
+    include_dirs: [iop/udpfs_smap/src, iop/udpfs_smap/include]
+    headers: *iop_headers
+    cflags: [-mno-check-zero-division]
+    imports_lst: iop/udpfs_smap/src/imports.lst
+    exports_tab: iop/udpfs_smap/src/exports.tab
+
+  - name: udpfs_ministack
+    type: iop
+    sources: [iop/udpfs_ministack/src/main.c, iop/udpfs_ministack/src/ministack_arp.c, iop/udpfs_ministack/src/ministack_eth.c, iop/udpfs_ministack/src/ministack_ip.c, iop/udpfs_ministack/src/ministack_udp.c, iop/udpfs_ministack/src/udptty.c]
+    include_dirs: [iop/udpfs_ministack/src, iop/udpfs_ministack/include, iop/udpfs_smap/include]
+    headers: *iop_headers
+    cflags: [-mno-check-zero-division]
+    imports_lst: iop/udpfs_ministack/src/imports.lst
+    exports_tab: iop/udpfs_ministack/src/exports.tab
+
+  - name: udpfs_ioman
+    type: iop
+    sources: [iop/udpfs_ioman/src/main.c, iop/udpfs_ioman/src/udprdma.c, iop/udpfs_ioman/src/udpfs_core.c, iop/udpfs_ioman/src/udpfs_ioman.c]
+    include_dirs: [iop/udpfs_ioman/src, iop/udpfs_ioman/include, iop/udpfs_smap/include, iop/udpfs_ministack/include]
+    headers: *iop_headers
+    defines: [FEATURE_UDPFS_IOMAN, UDPRDMA_MAX_SOCKETS=1]
+    cflags: [-mno-check-zero-division]
+    imports_lst: iop/udpfs_ioman/src/imports.lst
+    exports_tab: iop/udpfs_ioman/src/exports.tab
+
+  # Coherent MMCEMAN pinned to the same post-sio2man-fix generation
+  # used by RiptOPL. The SDK prebuilt is older and fails sustained transfers
+  # against current sio2man on real hardware. Keep SDK stock MMCEDRV below.
+  - name: mmceman
+    type: iop
+    sources:
+      - iop/mmceman/src/ioplib.c
+      - iop/mmceman/src/sio2man_hook.c
+      - iop/mmceman/src/mmce_sio2.c
+      - iop/mmceman/src/mmce_cmds.c
+      - iop/mmceman/src/mmce_fs.c
+      - iop/mmceman/src/mmceman.c
+    include_dirs: [iop/mmceman/include]
+    headers: *iop_headers
+    defines: [IOMANX_OLD_NAME_COMPATIBILITY=0, IOMANX_OLD_NAME_ADDDELDRV=0]
+    imports_lst: iop/mmceman/src/imports.lst
+
+  - name: ssb_mmce_stream
+    type: iop
+    sources: [iop/mmce_stream/src/main.c]
+    include_dirs: [iop/mmce_stream/src]
+    headers: *iop_headers
+    defines: [IOMANX_OLD_NAME_COMPATIBILITY=0, IOMANX_OLD_NAME_ADDDELDRV=0]
+    imports_lst: iop/mmce_stream/src/imports.lst
+
+  - name: ssb_usb_quiesce
+    type: iop
+    sources: [iop/usb_quiesce/src/main.c]
+    include_dirs: [iop/usb_quiesce/src]
+    headers: *iop_headers
+    imports_lst: iop/usb_quiesce/src/imports.lst
+
+  - name: ssb_audio
+    type: iop
+    sources: [iop/audio_server/src/main.c]
+    include_dirs: [iop/audio_server/src]
+    headers: *iop_headers
+    imports_lst: iop/audio_server/src/imports.lst
+
   - name: ssb_platform
     type: ee_lib
     sources:
@@ -35,8 +122,8 @@ targets:
       - mtap
       - mc
       - filexio
+      - usbd
       - patches
-      - sdr
       - debug
     defines:
       - PLATFORM_PS2
@@ -217,6 +304,7 @@ targets:
       - debug
       - m
     embed_irx:
+      - ssb_usb_quiesce
       - iomanx
       - filexio
       - sio2man
@@ -225,9 +313,33 @@ targets:
       - mcman
       - mcserv
       - libsd
-      - sdr
+      - ssb_audio
+      # Common BDM + physical transports.
       - bdm
       - bdmfs_fatfs
       - usbd_mini
       - usbmass_bd_mini
+      - dev9:ps2dev9
+      - ata_bd:ps2atad
+      - mx4sio_bd_mini:mx4sio_bd
+      - iLinkman
+      - IEEE1394_bd_mini:IEEE1394_bd
+
+      # Network storage. UDPBD is a BDM transport; UDPFS is an iomanX
+      # filesystem and therefore uses its own SMAP/ministack chain.
+      - smap_udpbd
+      - udpfs_smap
+      - udpfs_ministack
+      - udpfs_ioman
+
+      # APA/PFS HDD.
+      - apa:ps2hdd
+      - fs:ps2fs
+      - secrsif
+
+      # Optical filesystem for cdrom0: asset-pack launches.
+      - cdfs:cdvd
+
       - mmceman
+      - mmcedrv
+      - ssb_mmce_stream

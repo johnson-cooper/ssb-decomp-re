@@ -1,0 +1,7 @@
+intrman_IMPORTS_start
+I_DisableIntr
+intrman_IMPORTS_end
+
+thbase_IMPORTS_start
+I_DelayThread
+thbase_IMPORTS_end

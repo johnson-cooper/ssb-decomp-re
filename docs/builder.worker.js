@@ -1,7 +1,7 @@
 // Runs the whole conversion off the main thread. The ROM arrives as a
 // transferred ArrayBuffer and never leaves this worker except as SSB64.DAT.
 import { verifyRom } from "./core/rom.js";
-import { buildDat, BuildError } from "./core/build.js";
+import { buildDat, BuildError, expectedDatSha256 } from "./core/build.js";
 
 const MANIFEST_URL = new URL("./data/ssb64-us.manifest.json.gz", import.meta.url);
 const WEIGHTS = [
@@ -52,7 +52,7 @@ self.onmessage = async (e) => {
       report("Loading conversion data", 0);
       const manifest = await loadManifest();
       const dat = await buildDat(rom, manifest, report);
-      postMessage({ type: "done", dat: dat.buffer, size: dat.length, sha256: manifest.output.sha256 }, [dat.buffer]);
+      postMessage({ type: "done", dat: dat.buffer, size: dat.length, sha256: expectedDatSha256(manifest) }, [dat.buffer]);
     }
   } catch (err) {
     fail(err);

@@ -447,7 +447,13 @@ def normalise_palettes(files, relocs_by_fid, stats):
                             for q in range(hit[1], hit[1] + sz - (w - 1), w):
                                 trf.blob[q:q + w] = trf.blob[q:q + w][::-1]
                             stats["texels_restored"] += 1
-                elif op == 0xF0 and timg is not None:
+                elif op == 0xF0 and timg is not None and not timg_maybe_replaced:
+                    # Like texel loads above, a TLUT load after an unrelocated
+                    # segment DL may consume a texture image selected by that
+                    # runtime MObj list.  Do not reinterpret the last static
+                    # SETTIMG target as a palette: doing so byte-swaps CI texels
+                    # in the generated DAT and produces localized fighter
+                    # texture corruption.
                     count = ((w1 >> 14) & 0x3FF) + 1
                     _, _, tfid, toff = timg
                     ttype = target_type(tfid, toff)

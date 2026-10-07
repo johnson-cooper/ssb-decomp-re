@@ -9,25 +9,38 @@
  * voice is using.
  *
  * All register changes of one audio frame are collected in a sceSdBatch
- * array, copied to IOP RAM and executed with one sdrdrv call, so a frame
- * costs two IOP round trips regardless of the number of voices.
+ * array and sent in one call to the dedicated ssb_audio IOP server, so a
+ * frame costs one small RPC regardless of the number of voices.
  */
 #include <ps2/platform.h>
 #include <ps2/assetpack.h>
 #include <ps2/spu.h>
 
-#include <iopheap.h>
+#include <delaythread.h>
 #include <kernel.h>
-#include <libsdr.h>
+#include <libsd-common.h>
 #include <sifrpc.h>
 #include <string.h>
 
 #define SPU_CORE 1
 #define SPU_RAM_FIRST 0x5040u    /* below: core I/O buffers */
 #define SPU_RAM_LIMIT 0x1E0000u  /* above: kept free for effect work areas */
-#define IOP_STAGE_SIZE (32 * 1024)
 #define MAX_BATCH 512
 #define MAX_RESIDENT 256
+
+#define SSB_AUDIO_RPC_ID 0x53424155u
+#define SSB_AUDIO_RPC_SIZE 8192u
+#define SSB_AUDIO_UPLOAD_HDR 64u
+#define SSB_AUDIO_UPLOAD_MAX (SSB_AUDIO_RPC_SIZE - SSB_AUDIO_UPLOAD_HDR)
+
+enum
+{
+    SSB_AUDIO_CMD_INIT = 1,
+    SSB_AUDIO_CMD_BATCH = 2,
+    SSB_AUDIO_CMD_UPLOAD = 3,
+    SSB_AUDIO_CMD_GET_PARAM = 4,
+    SSB_AUDIO_CMD_GET_ADDR = 5
+};
 
 /* Voice envelope: instant attack, full sustain, short linear release so a
  * key-off (the N64 "stop voice") ends the sound within a few ms. */
@@ -62,17 +75,99 @@ static uint32_t sClock;
 static Voice sVoices[PS2_SPU_VOICES];
 static sceSdBatch sBatch[MAX_BATCH] __attribute__((aligned(64)));
 static int sBatchCount;
-static void *sIopStage;                   /* IOP RAM: sample upload staging */
-static void *sIopBatch;                   /* IOP RAM: batch array */
-static void *sIopRets;
+static SifRpcClientData_t sAudioRpc __attribute__((aligned(64)));
+static uint8_t sRpcSend[SSB_AUDIO_RPC_SIZE] __attribute__((aligned(64)));
+static uint32_t sRpcRecv[4] __attribute__((aligned(64)));
+static volatile int sRpcPending;
 static PS2SpuStats sStats;
 
-/* libsdr.a (PS2Build's sdr package) references this callback-state block
- * from its callback helpers (sdr_cb.o) without defining it; those helpers
- * are unused here, so plain storage is enough to link. */
-unsigned char g_libsdr_cb_data[256] __attribute__((aligned(64)));
+static int audio_rpc_bind(void)
+{
+    int i;
 
-static void probe_hardware(void);
+    memset(&sAudioRpc, 0, sizeof(sAudioRpc));
+    for (i = 0; i < 200; i++)
+    {
+        int rc = sceSifBindRpc(&sAudioRpc, SSB_AUDIO_RPC_ID, 0);
+
+        if (rc < 0)
+            return rc;
+        if (sAudioRpc.server != NULL)
+            return 0;
+        DelayThread(5000);
+    }
+    return -1;
+}
+
+static void audio_rpc_complete(void *arg)
+{
+    (void)arg;
+    sRpcPending = 0;
+}
+
+static int audio_rpc_drain(void)
+{
+    if (!sRpcPending)
+        return (int)sRpcRecv[0];
+
+    while (sceSifCheckStatRpc(&sAudioRpc))
+        DelayThread(50);
+
+    sRpcPending = 0;
+    return (int)sRpcRecv[0];
+}
+
+static int audio_rpc_call(int cmd, const void *send, uint32_t send_size)
+{
+    int rc;
+
+    if (send_size > SSB_AUDIO_RPC_SIZE)
+        return -1;
+
+    /* Upload/init calls share the client and staging buffer with the
+     * per-frame batch. Finish any previous asynchronous batch first. */
+    if (sRpcPending && audio_rpc_drain() < 0)
+        return -1;
+
+    memset(sRpcRecv, 0, sizeof(sRpcRecv));
+    FlushCache(0);
+    rc = sceSifCallRpc(&sAudioRpc, cmd, 0, (void *)send, (int)send_size,
+                       sRpcRecv, sizeof(sRpcRecv), NULL, NULL);
+    if (rc < 0)
+        return rc;
+    return (int)sRpcRecv[0];
+}
+
+static int audio_rpc_batch_async(const void *send, uint32_t send_size)
+{
+    int rc;
+
+    if (send_size > SSB_AUDIO_RPC_SIZE)
+        return -1;
+
+    /*
+     * The previous implementation blocked the audio/game thread on one SIF
+     * round-trip every 1/60 s. Keep only one request in flight, but overlap
+     * that request with the rest of the frame. Usually it has completed long
+     * before the next audio frame reaches this point; if not, only then do we
+     * wait before reusing the shared RPC buffer.
+     */
+    if (sRpcPending && audio_rpc_drain() < 0)
+        return -1;
+
+    memset(sRpcRecv, 0, sizeof(sRpcRecv));
+    FlushCache(0);
+    sRpcPending = 1;
+    rc = sceSifCallRpc(&sAudioRpc, SSB_AUDIO_CMD_BATCH, SIF_RPC_M_NOWAIT,
+                       (void *)send, (int)send_size,
+                       sRpcRecv, sizeof(sRpcRecv), audio_rpc_complete, NULL);
+    if (rc < 0)
+    {
+        sRpcPending = 0;
+        return rc;
+    }
+    return 0;
+}
 
 /* ------------------------------------------------------------------ */
 
@@ -90,13 +185,21 @@ static void batch_add(uint16_t func, uint16_t entry, uint32_t value)
 static void batch_submit(void)
 {
     int n = sBatchCount;
+    uint32_t bytes;
 
     sStats.batch_entries = (uint32_t)n;
     if (n == 0)
         return;
-    FlushCache(0);
-    sceSdTransToIOP(sBatch, sIopBatch, (uint32_t)((n * (int)sizeof(sceSdBatch) + 63) & ~63), 1);
-    sceSdRemote(1, rSdProcBatch, sIopBatch, sIopRets, n);
+
+    ((uint32_t *)sRpcSend)[0] = (uint32_t)n;
+    memcpy(sRpcSend + 4, sBatch, (size_t)n * sizeof(sceSdBatch));
+    bytes = 4u + (uint32_t)n * (uint32_t)sizeof(sceSdBatch);
+
+    if (audio_rpc_batch_async(sRpcSend, bytes) < 0)
+    {
+        sReady = 0;
+        ps2_log("audio: batch RPC failed; disabling audio");
+    }
     sBatchCount = 0;
 }
 
@@ -105,16 +208,26 @@ static void spu_upload(const uint8_t *src, uint32_t addr, uint32_t size)
 {
     uint32_t done = 0;
 
-    FlushCache(0);
     while (done < size)
     {
         uint32_t n = size - done;
+        uint32_t send_size;
 
-        if (n > IOP_STAGE_SIZE)
-            n = IOP_STAGE_SIZE;
-        sceSdTransToIOP((void *)(src + done), sIopStage, n, 1);
-        sceSdRemote(1, rSdVoiceTrans, 0, SD_TRANS_WRITE | SD_TRANS_MODE_DMA, sIopStage, addr + done, n);
-        sceSdRemote(1, rSdVoiceTransStatus, 0, 1);
+        if (n > SSB_AUDIO_UPLOAD_MAX)
+            n = SSB_AUDIO_UPLOAD_MAX;
+
+        memset(sRpcSend, 0, SSB_AUDIO_UPLOAD_HDR);
+        ((uint32_t *)sRpcSend)[0] = addr + done;
+        ((uint32_t *)sRpcSend)[1] = n;
+        memcpy(sRpcSend + SSB_AUDIO_UPLOAD_HDR, src + done, n);
+        send_size = (SSB_AUDIO_UPLOAD_HDR + n + 15u) & ~15u;
+
+        if (audio_rpc_call(SSB_AUDIO_CMD_UPLOAD, sRpcSend, send_size) < 0)
+        {
+            sReady = 0;
+            ps2_log("audio: sample upload RPC failed; disabling audio");
+            return;
+        }
         done += n;
     }
     sStats.uploads++;
@@ -224,6 +337,7 @@ int ps2_spu_init(void)
     uint32_t size, i;
     int v;
 
+    ps2_log("audio: SPU init stage 1/6 - reading sample header");
     ps2_rom_read(PS2_SPU_SAMPLES_VROM, &head, sizeof(head));
     if (memcmp(head.magic, PS2_SPU_SAMPLES_MAGIC, 4) != 0 || head.version != PS2_SPU_SAMPLES_VERSION)
     {
@@ -238,6 +352,8 @@ int ps2_spu_init(void)
                      sizeof(last));
         size = last.data_off + last.data_size;
     }
+    ps2_log("audio: SPU init stage 2/6 - sample set %u KiB, %u entries",
+            (unsigned)(size / 1024), (unsigned)head.count);
     sSet = (uint8_t *)ps2_mem_alloc(PS2_MEM_AUDIO, size, 64);
     sResidentOf = (int *)ps2_mem_alloc(PS2_MEM_AUDIO, head.count * sizeof(int), 16);
     if (sSet == NULL || sResidentOf == NULL)
@@ -245,27 +361,27 @@ int ps2_spu_init(void)
         ps2_log("audio: cannot allocate %u KiB for the sample set; audio stays silent", (unsigned)(size / 1024));
         return -1;
     }
+    ps2_log("audio: SPU init stage 3/6 - loading PS-ADPCM set");
     ps2_rom_read(PS2_SPU_SAMPLES_VROM, sSet, size);
     sEntries = (const PS2SpuSampleEntry *)(sSet + head.entries_offset);
     sCount = head.count;
     for (i = 0; i < sCount; i++)
         sResidentOf[i] = -1;
 
-    SifInitIopHeap();
-    sIopStage = SifAllocIopHeap(IOP_STAGE_SIZE);
-    sIopBatch = SifAllocIopHeap(MAX_BATCH * sizeof(sceSdBatch));
-    sIopRets = SifAllocIopHeap(MAX_BATCH * sizeof(uint32_t));
-    if (sIopStage == NULL || sIopBatch == NULL || sIopRets == NULL)
+    ps2_log("audio: SPU init stage 4/6 - binding dedicated RPC");
+    if (audio_rpc_bind() < 0)
     {
-        ps2_log("audio: IOP heap allocation failed; audio stays silent");
+        ps2_log("audio: ssb_audio RPC unavailable; audio stays silent");
         return -1;
     }
-    if (sceSdRemoteInit() < 0)
+
+    ps2_log("audio: SPU init stage 5/6 - initializing SPU2 core");
+    if (audio_rpc_call(SSB_AUDIO_CMD_INIT, sRpcSend, 0) < 0)
     {
-        ps2_log("audio: sdrdrv RPC unavailable; audio stays silent");
+        ps2_log("audio: ssb_audio init failed; audio stays silent");
         return -1;
     }
-    sceSdRemote(1, rSdInit, 0);
+    ps2_log("audio: SPU init stage 6/6 - configuring voices");
 
     /* core 1: all voices dry to the output, master volume full, no effects */
     batch_add(SD_BATCH_SETCORE, SPU_CORE | SD_CORE_EFFECT_ENABLE, 0);
@@ -430,31 +546,9 @@ void ps2_spu_flush(void)
     sStats.active_voices = (uint32_t)active;
     sStats.resident = (uint32_t)sResCount;
     batch_submit();
-    if ((sClock % 300) == 0)
-        probe_hardware();
 }
 
 const PS2SpuStats *ps2_spu_stats(void)
 {
     return &sStats;
-}
-
-/* Health check, run from the audio thread every few seconds: how many
- * voices have a non-zero hardware envelope, and a checksum of their play
- * addresses (it changes between probes when the SPU2 is really playing). */
-static void probe_hardware(void)
-{
-    uint32_t sounding = 0, nax_sum = 0;
-    int v;
-
-    for (v = 0; v < PS2_SPU_VOICES; v++)
-    {
-        if ((uint32_t)sceSdRemote(1, rSdGetParam, SD_VOICE(SPU_CORE, v) | SD_VPARAM_ENVX) & 0x7FFF)
-        {
-            sounding++;
-            nax_sum += (uint32_t)sceSdRemote(1, rSdGetAddr, SD_VOICE(SPU_CORE, v) | SD_VADDR_NAX);
-        }
-    }
-    sStats.hw_sounding = sounding;
-    sStats.hw_nax_sum = nax_sum;
 }

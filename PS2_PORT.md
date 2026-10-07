@@ -35,18 +35,51 @@ ps2/tools/prepare_assets.sh          # once per ROM / asset change -> ps2/build/
 cd ps2 && ps2build build             # -> ps2/build/bin/ssb64.elf
 ```
 
-`ps2build build` makes the production ELF: the debugging aids are compiled
-out. For a debug build, add `- PS2_DEBUG=1` to the `defines` of the
-`ssb_platform` target in `ps2/ps2.yaml`. That enables the debug overlay
-(Select + R3), the hardware diagnostics (Select + L3 frame clear, Select + R1
-row-coverage capture), framebuffer scan-out counters in the log, and
-`SSB64.LOG` written at boot. Both builds write `SSB64.LOG` after a crash or
-fatal error.
+The normal `ps2build build` is the production configuration. For a hardware-debug
+build, add `- PS2_DEBUG=1` to the `defines` of the `ssb_platform` target in
+`ps2/ps2.yaml`. That enables the Select + R3 debug overlay, Select + L3
+frame-clear diagnostic, Select + R1 row-coverage capture, and extra framebuffer
+scan-out diagnostics. The final audio path uses the dedicated `ssb_audio` IOP
+server rather than SDR/sdrdrv.
 
-Copy `ssb64.elf` and `SSB64.DAT` to the same directory on any boot device
-(USB mass storage, memory card, MMCE, or `host:` in PCSX2) and run the ELF.
-The boot code finds the pack next to the ELF from `argv[0]`; no path is
-hard-coded.
+Copy `ssb64.elf` and `SSB64.DAT` to the same directory and run the ELF.
+The boot layer derives the launch/data device from `argv[0]` and supports
+`host:`, generic `massN:` BDM mounts, explicit USB, internal ATA/exFAT BDM,
+MX4SIO, iLink, MMCE, APA/PFS HDD, UDPBD, UDPFS, memory card and `cdrom0:`.
+
+Launches from `massN:` work from any launcher (OPL, RiptOPL, wLaunchELF,
+launcHER, ...) and do not depend on the launcher's IOP surviving: whether it
+does is launcher-specific (RiptOPL's "Reboot IOP", for example, leaves a bare
+ROM IOP). The port halts any USB host controller the launcher left running,
+resets the IOP exactly once, loads its own BDM + USB stack and finds the
+`massN:` slot that holds the same relative path to `SSB64.DAT`. If the pack is
+not on USB after 5 s, MX4SIO, iLink and ATA are added to the live stack
+without another reset. Explicit transport identities such as `usb0:`,
+`ata0:`, `mx4sio0:`, `ilink0:` and `udpbd:` are rebuilt the same way and
+resolved to the `massN:` filesystem of that transport.
+
+The asset pack can also live on a different device from the ELF:
+
+```text
+ssb64.elf --data=usb0:/SSB64/
+ssb64.elf --data=mmce0:/SSB64/
+ssb64.elf --data=hdd0:+OPL:pfs:/SSB64/
+ssb64.elf --data=udpfs:/SSB64/
+```
+
+This is particularly useful when the launcher lives on a memory card, since
+`SSB64.DAT` is much larger than a standard 8 MiB card. For cross-device
+`--data=` use, prefer a typed transport such as `usb0:`, `ata0:`,
+`mx4sio0:` or `ilink0:`; a generic `massN:` data path is located by probing
+(USB first) as described above.
+
+Network modes inherit
+the PS2's address from `mc0:/SYS-CONF/IPCONFIG.DAT` or
+`mc1:/SYS-CONF/IPCONFIG.DAT`. UDPBD/UDPFS use their legacy unauthenticated
+LAN discovery protocols, so treat them as trusted-LAN transports rather than
+Internet-facing services; after discovery this port binds data replies to the
+selected peer. A bare `bdm:` path is rejected because it does not identify a
+transport or an existing filesystem mount.
 
 Testing in PCSX2 (Windows helpers, default Pad 1 keyboard bindings):
 
@@ -156,50 +189,54 @@ low-priority thread, debounced. Two slots (A/B) with sequence number + CRC;
 the newest valid slot wins at boot, so a torn write never loses the previous
 save. Without a formatted card, saves stay in RAM.
 
-### Boot (`ps2/src/platform/boot.c`, `iop.c`)
-Order: log → memory → boot path from `argv[0]` → IOP reset (except `host:`)
-+ base modules (embedded IRX: iomanX, fileXio, sio2man, mtapman, padman,
-mcman/mcserv) → GS → VBlank → boot-device drivers (bdm + FAT + USB mass
-storage, or mmceman) → threads/VI → scene arena → overlay state → input →
-assets → saves → sound drivers (libsd, sdr) → audio → render thread → the
-game's own `syMainLoop`. The sound drivers are optional: if they fail to
-load, the game runs silent.
+### Boot (`ps2/src/platform/boot.c`, `iop.c`, `storage/bootpath.c`)
+Launch identity, filesystem identity and asset location are separate. The
+default data directory is beside the ELF, while `--data=<directory>` can
+select another device.
 
-`sdr.irx` (ps2sdk's sdrdrv) returns `MODULE_REMOVABLE_END` (2) from its
-module start, which only IOP MODLOAD versions newer than 1.2 accept. After
-the IOP reset the console's own `rom0:MODLOAD` loads it, and on hardware that
-hung the boot at "IOP: loading sdr". `iop.c` therefore loads a RAM copy of
-the module patched to return `MODULE_RESIDENT_END` (0); if the patch site is
-not found, sdr is skipped and the game runs silent.
+The IOP policy is deliberately transport-aware:
 
-#### Troubleshooting on hardware
+- `host:` and bare inherited `pfsN:` mounts are kept alive because
+  resetting the IOP would destroy information that `argv[0]` does not
+  contain.
+- Every other path resets the IOP exactly once. Before that reset, a small
+  module (`ssb_usb_quiesce`) halts any OHCI USB controller the launcher left
+  running: PS2SDK's usbd does not stop it on IOP reboot, so it would keep
+  DMAing into IOP RAM while the new kernel loads, which hung the reset from
+  some launchers. No path resets the IOP again once its USB stack is up;
+  on hardware the stick never came back after a second reset.
+- Generic `massN:` is a connection-order alias, not a transport. It is rebuilt
+  as USB first and resolved by finding the slot that holds `SSB64.DAT`;
+  MX4SIO/iLink/ATA are added to the live stack after 5 s if needed.
+- Explicit USB, ATA/exFAT, MX4SIO, iLink, UDPBD, UDPFS, MMCE, APA/PFS and
+  optical paths can be reconstructed from embedded drivers after a clean IOP
+  reset.
+- Typed BDM identities are resolved back to the matching `massN:` filesystem
+  by verifying both `SSB64.DAT` and the BDM driver's transport token. This
+  avoids assuming that BDM slot numbers and transport unit numbers are the
+  same.
+- Unknown paths are rejected; there is no "unknown means USB" fallback.
 
-Until the GS is initialised, every boot stage paints the whole screen in its
-own colour (GS `BGCOLOR`, no printf or IOP involved). A hang leaves the
-colour of the stage that did not finish:
+The embedded IOP stacks are:
 
-| colour | stage |
+| data path | IOP stack / handling |
 |---|---|
-| navy `000080` | started (before the IOP reset) |
-| magenta `800080` | IOP reset request |
-| orange `804000` | IOP reset synced |
-| yellow `808000` | SIF RPC, loader, IOP heap, sbv patches |
-| olive `406000` | loading iomanX |
-| yellow-green `408000` | loading fileXio |
-| lime `60A000` | fileXio RPC init |
-| green `008000` | loading sio2man |
-| dark green `006020` | loading mtapman |
-| grey `404040` | loading padman |
-| pink `804040` | loading mcman |
-| brown `402000` | loading mcserv |
-| dark red `800000` | an IOP base module failed to load (stopped on purpose) |
-| bright blue `0000FF` | GS video init entered |
-| white `FFFFFF` … violet `8000FF` | GS init steps (white, bright green, bright orange, bright yellow, bright magenta, violet; bright red = GIF channel init failed) |
+| `host:` | inherited ps2link/PCSX2 filesystem |
+| `massN:` | bdm + bdmfs_fatfs + usbd_mini + usbmass_bd_mini; after 5 s without the pack, + iLink, ATA, MX4SIO |
+| `usbN:` | bdm + bdmfs_fatfs + usbd_mini + usbmass_bd_mini |
+| `ataN:` | ps2dev9 + bdm + bdmfs_fatfs + BDM-enabled ps2atad |
+| `mx4sioN:` | bdm + bdmfs_fatfs + mx4sio_bd |
+| `ilinkN:` | bdm + bdmfs_fatfs + iLinkman + IEEE1394_bd |
+| `udpbd:` | ps2dev9 + bdm + bdmfs_fatfs + SUDPBDv2 SMAP/UDPBD |
+| `udpfs:` | ps2dev9 + UDPFS SMAP + ministack + udpfs_ioman |
+| `hdd0:<partition>:pfs:/...` | ps2dev9 + ps2atad + ps2hdd + ps2fs, then mount on `pfs0:` |
+| `pfsN:` | inherited PFS mount (partition identity is not recoverable from a bare PFS path) |
+| `mmceN:` | mmceman |
+| `mcN:` | base mcman/mcserv stack |
+| `cdrom0:` | cdfs, with ISO9660 `;1` fallback for `SSB64.DAT` |
 
-After GS init, the screen shows the boot log as text instead, and every
-later stage (boot-device drivers, sound drivers, assets) is added as a line
-as it starts, so a hang shows as the last line. Once the boot device is
-mounted, the log is also written to `SSB64.LOG` next to the ELF.
+Real-device files are read in bounded 64 KiB requests and the boot path allows
+up to roughly 20 seconds for asynchronous BDM/network media to become ready.
 
 ### Game-source changes
 - `include/PR/rcp.h`: register reads/writes go through the platform layer.
